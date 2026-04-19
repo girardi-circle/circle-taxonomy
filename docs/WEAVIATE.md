@@ -1,241 +1,185 @@
 # WEAVIATE.md
 
-## Weaviate Collection Schema & Query Patterns
+## Weaviate Collections & Query Patterns
 
-Weaviate serves a single purpose in this system: **semantic similarity matching for subtopics.** It does not store transcripts, issues, or any customer data.
+**Client version:** `weaviate-client>=4.6.0` (v4 API). All code uses v4 patterns.
+**Vectorizer:** `text2vec-weaviate` (Weaviate Cloud built-in, no external API key required).
+**Instance:** Weaviate Cloud Serverless.
+
+Weaviate is a derived search index — Redshift is the source of truth. Always write to Redshift first, then sync to Weaviate.
 
 ---
 
-## Collection: SubTopic
+## Collection 1: SubTopic
+
+**Purpose:** Classification pipeline (Step 2). Single collection holds both **approved subtopics** and **pending emerging candidates**, distinguished by the `status` field. This allows the classification pipeline to check for existing pending candidates in the same query as approved subtopics — preventing duplicate candidates from being created.
 
 ### Properties
 
 | Property | Type | Vectorized | Description |
 |----------|------|-----------|-------------|
-| subtopic_id | int | No | Cross-reference to `taxonomy.sub_topics.id` in Redshift |
-| topic_id | int | No | Cross-reference to `taxonomy.topics.id`. Used for filtered queries. |
-| product_area_id | int | No | Cross-reference to `taxonomy.product_areas.id`. Nullable. Used for filtered queries. |
-| name | text | No | Subtopic name. Stored for readability in results, not vectorized. |
-| canonical_description | text | **Yes** | Primary vector field. This is what gets embedded and searched against. |
+| subtopic_id | INT | No | FK to `taxonomy.sub_topics.id`. 0 for pending candidates. |
+| candidate_id | INT | No | FK to `taxonomy.emerging_candidates.id`. 0 for approved subtopics. |
+| status | TEXT | No | `"approved"` or `"pending"` |
+| topic_id | INT | No | FK to `taxonomy.topics.id`. 0 for pending candidates. |
+| product_area_id | INT | No | FK to `taxonomy.product_areas.id`. 0 if unassigned. |
+| name | TEXT | No | Subtopic name for readability. |
+| canonical_description | TEXT | **Yes** | Primary vector field. Searched against issue `segment_description`. |
 
-### Vectorizer configuration
+### Dual-status lifecycle
 
-Use Weaviate's built-in text2vec module or an external embedding model. The choice of embedding model affects match quality and threshold calibration.
+```
+Band C fires (auto_create=False)
+    → INSERT into Weaviate SubTopic with status="pending", candidate_id=<id>, subtopic_id=0
+    → INSERT into taxonomy.emerging_candidates
 
-**Options under consideration:**
-- `text2vec-openai` (text-embedding-3-small)
-- `text2vec-cohere` (embed-english-v3.0)
-- Voyage AI embeddings via custom vectorizer
-- Weaviate's built-in `text2vec-transformers`
+Reviewer approves candidate
+    → UPDATE Weaviate object: status="approved", subtopic_id=<new_id>, candidate_id=0
+    → If no Weaviate entry found (pre-migration candidate): INSERT fresh with status="approved"
 
-Whichever model is chosen, the same model must be used for both indexing subtopic descriptions and embedding issue `segment_description` at query time.
-
-### Index configuration
-
-```python
-{
-    "vectorIndexType": "hnsw",
-    "vectorIndexConfig": {
-        "ef": 128,
-        "efConstruction": 256,
-        "maxConnections": 32
-    }
-}
+Reviewer rejects or merges candidate
+    → DELETE Weaviate object (so it can no longer be matched)
+    → UPDATE taxonomy.emerging_candidates status='rejected'
 ```
 
-At expected scale (50-500 subtopics), a single Weaviate node handles this easily.
+### Schema migration
 
----
+The `status` and `candidate_id` properties were added after initial setup. Run once:
 
-## Query patterns
+```
+POST /api/weaviate/migrate/subtopic-status
+```
 
-### Pattern 1: Unfiltered top-N search
+This adds both properties and backfills all existing objects with `status="approved"`, `candidate_id=0`.
 
-Used in Step 2 (Classification) for most issues. Finds the 5 nearest subtopics regardless of topic or product area.
+### Query patterns (v4 client)
 
+**Search for nearest subtopics (classification pipeline):**
 ```python
-result = (
-    client.query
-    .get("SubTopic", ["subtopic_id", "topic_id", "product_area_id", "name", "canonical_description"])
-    .with_near_text({"concepts": [segment_description]})
-    .with_limit(5)
-    .with_additional(["distance"])
-    .do()
+collection = client.collections.get("SubTopic")
+results = collection.query.near_text(
+    query=segment_description,
+    limit=5,
+    return_metadata=MetadataQuery(distance=True),
+)
+for obj in results.objects:
+    status = obj.properties.get("status")       # "approved" or "pending"
+    subtopic_id = obj.properties.get("subtopic_id")
+    candidate_id = obj.properties.get("candidate_id")
+    distance = obj.metadata.distance
+```
+
+**Find pending candidate by candidate_id:**
+```python
+results = collection.query.fetch_objects(
+    filters=Filter.by_property("candidate_id").equal(candidate_id),
+    limit=1,
 )
 ```
 
-### Pattern 2: Filtered by product area
-
-Used when the issue's product area is already known. Narrows the search space.
-
+**Find approved subtopic by subtopic_id:**
 ```python
-result = (
-    client.query
-    .get("SubTopic", ["subtopic_id", "topic_id", "name", "canonical_description"])
-    .with_near_text({"concepts": [segment_description]})
-    .with_where({
-        "path": ["product_area_id"],
-        "operator": "Equal",
-        "valueInt": known_product_area_id
-    })
-    .with_limit(5)
-    .with_additional(["distance"])
-    .do()
+results = collection.query.fetch_objects(
+    filters=Filter.by_property("subtopic_id").equal(subtopic_id),
+    limit=1,
 )
-```
-
-### Pattern 3: Filtered by topic
-
-Used when the topic is known and you want to find the most relevant subtopic within it.
-
-```python
-result = (
-    client.query
-    .get("SubTopic", ["subtopic_id", "name", "canonical_description"])
-    .with_near_text({"concepts": [segment_description]})
-    .with_where({
-        "path": ["topic_id"],
-        "operator": "Equal",
-        "valueInt": known_topic_id
-    })
-    .with_limit(5)
-    .with_additional(["distance"])
-    .do()
-)
-```
-
-### Pattern 4: Second-pass unfiltered check (new subtopic proposal)
-
-Used in Step 2.4. When the filtered search returns no match, run one more unfiltered search at a tighter threshold to catch subtopics under a different product area that are semantically identical. Prevents cross-product-area duplicates.
-
-```python
-result = (
-    client.query
-    .get("SubTopic", ["subtopic_id", "topic_id", "product_area_id", "name", "canonical_description"])
-    .with_near_text({"concepts": [segment_description]})
-    .with_limit(3)
-    .with_additional(["distance"])
-    .do()
-)
-
-# Only consider results with distance < 0.20 (tighter than normal Band A)
-```
-
-### Pattern 5: Duplicate detection (Step 4)
-
-Used in centroid maintenance to find near-duplicate subtopics.
-
-```python
-for subtopic in all_subtopics:
-    result = (
-        client.query
-        .get("SubTopic", ["subtopic_id", "name"])
-        .with_near_text({"concepts": [subtopic["canonical_description"]]})
-        .with_where({
-            "path": ["subtopic_id"],
-            "operator": "NotEqual",
-            "valueInt": subtopic["subtopic_id"]
-        })
-        .with_limit(3)
-        .with_additional(["distance"])
-        .do()
-    )
-    # Flag pairs with distance < 0.15 for human review
 ```
 
 ---
 
-## Write patterns
+## Collection 2: ClassifiedIssue
 
-### Insert new subtopic (after approval)
+**Purpose:** RAG chat (Phase 2c). Semantic search over classified issues with dimensional filters. Also used to update sub_topic_id after classification assigns a subtopic.
 
-Called by Step 3 when an emerging candidate is approved.
+### Properties
 
-```python
-client.data_object.create(
-    class_name="SubTopic",
-    data_object={
-        "subtopic_id": new_subtopic_id,
-        "topic_id": topic_id,
-        "product_area_id": product_area_id,  # Can be None
-        "name": subtopic_name,
-        "canonical_description": canonical_description
-    }
-)
-```
+| Property | Type | Vectorized | Description |
+|----------|------|-----------|-------------|
+| issue_id | INT | No | FK to `taxonomy.classified_issues.id` |
+| transcript_id | INT | No | FK to `taxonomy.transcripts.id` |
+| sub_topic_id | INT | No | FK to `taxonomy.sub_topics.id`. 0 if unmatched. |
+| topic_id | INT | No | 0 if unmatched. |
+| product_area_id | INT | No | 0 if unmatched. |
+| nature_id | INT | No | FK to `taxonomy.natures.id` |
+| intent_id | INT | No | FK to `taxonomy.intents.id` |
+| sentiment | TEXT | No | positive, negative, neutral, frustrated |
+| classified_at | TEXT | No | ISO date string. Enables timeframe filtering. |
+| source_url | TEXT | No | Link to original ticket/call. |
+| segment_description | TEXT | **Yes** | Primary vector field. |
+| verbatim_excerpt | TEXT | No | Raw customer quotes. Sent to Claude as context. |
 
-### Update canonical description (centroid maintenance)
+### Sync strategy
 
-Called by Step 4 when a subtopic's description is regenerated.
-
-```python
-result = (
-    client.query
-    .get("SubTopic", ["_additional { id }"])
-    .with_where({
-        "path": ["subtopic_id"],
-        "operator": "Equal",
-        "valueInt": target_subtopic_id
-    })
-    .do()
-)
-
-weaviate_id = result["data"]["Get"]["SubTopic"][0]["_additional"]["id"]
-
-client.data_object.update(
-    uuid=weaviate_id,
-    class_name="SubTopic",
-    data_object={
-        "canonical_description": new_description
-    }
-)
-```
-
-### Delete subtopic (after merge)
-
-Called when a reviewer merges a duplicate subtopic into another.
-
-```python
-result = (
-    client.query
-    .get("SubTopic", ["_additional { id }"])
-    .with_where({
-        "path": ["subtopic_id"],
-        "operator": "Equal",
-        "valueInt": subtopic_id_to_delete
-    })
-    .do()
-)
-
-weaviate_id = result["data"]["Get"]["SubTopic"][0]["_additional"]["id"]
-client.data_object.delete(uuid=weaviate_id, class_name="SubTopic")
-```
+- **Bulk sync:** `POST /api/weaviate/sync/issues` — loads all issues from Redshift
+- **After classification:** `update_classified_issue_subtopic()` patches existing object with assigned sub_topic_id/topic_id/product_area_id
+- Note: bulk sync uses batch insert (not upsert) — running it twice creates duplicates. Always check the status page first.
 
 ---
 
-## Sync strategy: Redshift → Weaviate
+## Collection 3: Transcript
 
-Redshift is the source of truth. Weaviate is a derived search index.
+**Purpose:** RAG chat (Phase 2c). Conversation-level semantic search for account history, similar calls, agent coaching.
 
-**Writes always go to Redshift first, then sync to Weaviate.** Never write to Weaviate directly without a corresponding Redshift record.
+### Properties
 
-**Sync triggers:**
-- New subtopic approved (Step 3) → insert into Weaviate
-- Canonical description updated (Step 4) → update in Weaviate
-- Subtopic deactivated or merged → delete from Weaviate
+| Property | Type | Vectorized | Description |
+|----------|------|-----------|-------------|
+| transcript_id | INT | No | FK to `taxonomy.transcripts.id` |
+| source_id | TEXT | No | Original ticket/call ID |
+| source_type | TEXT | No | 'zendesk', 'fathom' |
+| community_id | INT | No | 0 if null |
+| title | TEXT | No | Ticket subject or call title |
+| source_url | TEXT | No | Link to original source |
+| summary | TEXT | No | Claude-generated summary. Sent as context. |
+| raw_text | TEXT | **Yes** | Full conversation. Primary vector field. |
 
-**Consistency check:** Step 4 should include a reconciliation step comparing subtopic IDs in Weaviate against active subtopics in Redshift.
+---
+
+## Setup sequence
+
+Run these once before using the classification pipeline:
+
+```
+1. POST /api/weaviate/setup                        # Create all 3 collections
+2. POST /api/weaviate/migrate/subtopic-status      # Add status + candidate_id to SubTopic
+3. POST /api/weaviate/sync/issues                  # Bulk load ClassifiedIssue
+4. POST /api/weaviate/sync/transcripts             # Bulk load Transcript
+```
+
+SubTopic is populated dynamically as candidates are created and approved — no bulk load needed.
 
 ---
 
 ## Distance interpretation
 
-Weaviate returns cosine distance (0 = identical, 2 = opposite). In practice, values above 0.5 are irrelevant.
+Weaviate returns cosine distance (0 = identical, 2 = opposite). All collections use the same embedding model so distances are comparable.
 
-| Distance | Interpretation | Pipeline action |
-|----------|---------------|----------------|
-| < 0.15 | Strong semantic match | Band A: auto-assign subtopic |
-| 0.15 – 0.35 | Plausible but ambiguous | Band B: send to Claude for arbitration |
-| > 0.35 | No meaningful match | Band C: propose new subtopic |
+### Classification bands (SubTopic)
 
-**These thresholds depend on the embedding model.** Run a calibration set of 50-100 known issue-subtopic pairs to establish the right values.
+| Distance | Band | Action |
+|----------|------|--------|
+| < 0.15 | A | Auto-assign or auto-link to candidate |
+| 0.15 – 0.35 | B | Claude arbitration |
+| > 0.35 | C | Propose new subtopic or candidate |
+
+### RAG retrieval (Phase 2c — not yet built)
+
+| Distance | Action |
+|----------|--------|
+| < 0.25 | Include as primary source |
+| 0.25 – 0.40 | Include if under retrieval limit |
+| > 0.40 | Discard |
+
+---
+
+## Status page
+
+`GET /api/weaviate/collections/status` returns Redshift vs Weaviate counts for all three collections:
+
+```json
+{
+  "ClassifiedIssue": {"redshift": 1241, "weaviate": 1241, "unsynced": 0, "description": "..."},
+  "Transcript": {"redshift": 350, "weaviate": 350, "unsynced": 0, "description": "..."},
+  "SubTopic": {"redshift": 26, "weaviate": 24, "unsynced": 2, "description": "..."}
+}
+```

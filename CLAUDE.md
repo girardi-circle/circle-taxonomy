@@ -4,23 +4,27 @@
 
 Automated ticket categorization system that classifies customer support tickets (Zendesk) and call transcripts (Fathom) into a multi-dimensional taxonomy. Each transcript is decomposed into individual issues, each classified by topic > subtopic, intent, nature, and sentiment.
 
-The project is built in two phases. Phase 1 covers extraction (turning transcripts into classified issues). Phase 2 adds vector-based subtopic matching, the review queue, and taxonomy management.
+Built in two phases: Phase 1 covers extraction (transcripts → classified issues). Phase 2 adds Weaviate-based subtopic matching, a human review queue, and taxonomy management.
+
+---
 
 ## Tech stack
 
 - **Core logic:** Python 3.11+
-- **Web API:** FastAPI
-- **Frontend:** React + Vite + Tailwind CSS + shadcn/ui
-- **AI extraction:** Claude API (Anthropic) via `anthropic` Python SDK. Model per prompt defined in `shared/config.py`.
-- **Relational store:** Redshift (schema: `taxonomy`, database: `dev`)
-- **Vector search:** Weaviate (Phase 2 only)
-- **Future orchestration:** Dagster (not used in current development)
+- **Web API:** FastAPI + Uvicorn
+- **Frontend:** React 18 + Vite + Tailwind CSS (shadcn/ui components)
+- **AI:** Anthropic Claude via `anthropic` Python SDK
+- **Relational store:** Redshift (`taxonomy` schema, `dev` database)
+- **Vector search:** Weaviate Cloud (v4 client, `weaviate-client>=4.6.0`)
+- **Future orchestration:** Dagster (not yet used)
+
+---
 
 ## Configuration
 
-Secrets and configuration are kept separate. Secrets go in `.env` (gitignored). Everything else lives in `shared/config.py` (version-controlled).
+Secrets in `.env` (gitignored). Everything else in `shared/config.py`.
 
-### .env — secrets only (gitignored)
+### .env — secrets only
 
 ```bash
 ANTHROPIC_API_KEY=sk-ant-...
@@ -29,88 +33,67 @@ REDSHIFT_PORT=5439
 REDSHIFT_DB=dev
 REDSHIFT_USER=...
 REDSHIFT_PASSWORD=...
-# Phase 2 only:
 WEAVIATE_URL=...
 WEAVIATE_API_KEY=...
 ```
 
-### shared/config.py — secrets + all configuration in one place
+### shared/config.py — all non-secret configuration
 
 ```python
-import os
-from dotenv import load_dotenv
+# Models
+MODEL_EXTRACTION    = "claude-sonnet-4-20250514"
+MODEL_ARBITRATION   = "claude-sonnet-4-20250514"
+MODEL_NEW_SUBTOPIC  = "claude-opus-4-7"
+MODEL_CENTROID_UPDATE = "claude-sonnet-4-20250514"
+MODEL_RAG_CHAT      = "claude-sonnet-4-20250514"
 
-load_dotenv()
+# Extraction pipeline
+EXTRACTION_BATCH_LIMIT   = 10
+EXTRACTION_TEMPERATURE   = 0.0
+MAX_CONCURRENCY          = 8       # ThreadPoolExecutor workers
+SLEEP_BETWEEN_BATCHES    = 2
 
-# === Secrets (from .env) ===
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-REDSHIFT_HOST = os.environ["REDSHIFT_HOST"]
-REDSHIFT_PORT = int(os.environ.get("REDSHIFT_PORT", 5439))
-REDSHIFT_DB = os.environ["REDSHIFT_DB"]
-REDSHIFT_USER = os.environ["REDSHIFT_USER"]
-REDSHIFT_PASSWORD = os.environ["REDSHIFT_PASSWORD"]
-# Phase 2:
-WEAVIATE_URL = os.environ.get("WEAVIATE_URL")
-WEAVIATE_API_KEY = os.environ.get("WEAVIATE_API_KEY")
+# Parallel processing
+CLAUDE_MAX_CONCURRENCY   = 8       # Semaphore cap for concurrent Claude calls
+MAX_DB_CONNS             = 10      # ThreadedConnectionPool maxconn
+CLAUDE_MAX_RETRIES       = 6
+CLAUDE_BACKOFF_BASE      = 1.0
+CLAUDE_BACKOFF_CAP       = 30.0
+DB_MAX_RETRIES           = 5
+DB_BACKOFF_BASE          = 0.5
+DB_BACKOFF_CAP           = 10.0
+PREFETCH                 = 50
 
-# === Model assignments per prompt ===
-MODEL_EXTRACTION = "claude-sonnet-4-20250514"        # Prompt 1: high volume, structured task
-MODEL_ARBITRATION = "claude-sonnet-4-20250514"       # Prompt 2: simple decision (Phase 2)
-MODEL_NEW_SUBTOPIC = "claude-opus-4-6-20250415"      # Prompt 3: needs reasoning depth (Phase 2)
-MODEL_CENTROID_UPDATE = "claude-sonnet-4-20250514"   # Prompt 4: low stakes (Phase 2)
+# Classification bands (Weaviate cosine distance)
+BAND_A_CEILING           = 0.15   # auto-assign
+BAND_B_CEILING           = 0.35   # Claude arbitration
+CLUSTER_SIMILARITY       = 0.85
+DUPLICATE_DETECTION_THRESHOLD = 0.15
 
-# === Pipeline defaults ===
-EXTRACTION_BATCH_LIMIT = 10
-EXTRACTION_MAX_RETRIES = 3
-EXTRACTION_TEMPERATURE = 0.0
-MAX_CONCURRENCY = 8
-SLEEP_BETWEEN_BATCHES = 2  # seconds
+# Weaviate
+WEAVIATE_VECTORIZER      = "text2vec-weaviate"
+CLASSIFICATION_BATCH_LIMIT = 100
 
-# === Phase 2 thresholds ===
-BAND_A_CEILING = 0.15       # Below: auto-assign subtopic (vector_direct)
-BAND_B_CEILING = 0.35       # Below: send to Claude for arbitration (llm_confirmed)
-CLUSTER_SIMILARITY = 0.85   # Minimum similarity to group unmatched issues
-DUPLICATE_DETECTION_THRESHOLD = 0.15  # Flag subtopic pairs closer than this
+# RAG (Phase 2c — not yet built)
+RAG_CHAT_TEMPERATURE         = 0.3
+RAG_CHAT_MAX_TOKENS          = 2048
+RAG_ISSUE_RETRIEVAL_LIMIT    = 20
+RAG_TRANSCRIPT_RETRIEVAL_LIMIT = 10
+RAG_RELEVANCE_THRESHOLD      = 0.40
+
+# Pricing (USD per million tokens)
+MODEL_PRICING = {
+    "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
+    "claude-opus-4-7":          {"input": 15.00, "output": 75.00},
+}
 ```
 
-All prompt modules import their model and settings from `shared/config.py`. To change a model or threshold, edit one file — nothing else needs to change.
-
-### shared/prompts/fields.py — valid field values + validation
-
-This file defines the valid values for each classification dimension. Prompt templates import these lists to inject into the prompt, and validation logic uses them to verify Claude's output.
-
-```python
-# Valid classification values — single source of truth
-NATURES = ["Bug", "Feedback", "Question", "Complaint", "Feature Request", "Exploration"]
-INTENTS = ["Support", "Action", "Insights", "Strategy", "Sales"]
-SENTIMENTS = ["positive", "negative", "neutral", "frustrated"]
-
-# Formatted strings for prompt injection
-NATURES_PROMPT = "[" + ", ".join(NATURES) + "]"
-INTENTS_PROMPT = "[" + ", ".join(INTENTS) + "]"
-SENTIMENTS_PROMPT = "[" + ", ".join(SENTIMENTS) + "]"
-
-# Validation helpers — used after Claude returns a response
-def validate_nature(value: str) -> str | None:
-    """Returns the canonical name if valid, None if not."""
-    lookup = {n.lower().replace(" ", "_"): n for n in NATURES}
-    return lookup.get(value.lower().replace(" ", "_"))
-
-def validate_intent(value: str) -> str | None:
-    lookup = {i.lower(): i for i in INTENTS}
-    return lookup.get(value.lower())
-
-def validate_sentiment(value: str) -> str | None:
-    return value.lower() if value.lower() in SENTIMENTS else None
-```
-
-When Claude returns `"nature": "feature_request"`, the validation helper normalizes it to `"Feature Request"` and maps it to the correct FK in `taxonomy.natures`. If Claude returns an unexpected value, the validator returns `None` and the pipeline can log and handle the error.
+---
 
 ## Running locally
 
 ```bash
-# Backend
-cd backend
+# Backend (from project root/backend/)
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 
@@ -118,308 +101,467 @@ uvicorn app.main:app --reload --port 8000
 cd frontend
 npm install
 npm run dev
-# Vite dev server proxies /api/* to localhost:8000
 ```
 
-Vite config must proxy `/api` to `http://localhost:8000` to avoid CORS issues.
+Vite proxies `/api/*` to `http://localhost:8000`.
 
 ---
 
-## Phase 1 — Extraction
-
-Phase 1 reads unprocessed transcripts from Redshift, sends them to Claude for decomposition into issues, and provides a UI to trigger the process, monitor progress, and browse results.
-
-### What exists before Phase 1
-
-The following Redshift tables are already created and populated:
-- `taxonomy.natures` — 6 rows (Bug, Feedback, Question, Complaint, Feature Request, Exploration)
-- `taxonomy.intents` — 5 rows (Support, Action, Insights, Strategy, Sales)
-- `taxonomy.product_areas` — 8 rows (CMS, Live, Paywalls, Growth, CRM, Email Hub, Apps, Circle Plus)
-- `taxonomy.transcripts` — pre-loaded from `circle.dbt_daniel.int_control_studio__conversations_unioned`. Contains `source_id`, `source_type`, `community_id`, `title`, `raw_text`, `source_url`. The `summary` column is NULL for all rows (filled by Phase 1).
-
-The following tables exist but are empty:
-- `taxonomy.classified_issues`
-- `taxonomy.topics`
-- `taxonomy.sub_topics`
-- `taxonomy.emerging_candidates`
-- `taxonomy.axioms`
-
-### Phase 1 project structure
+## Project structure
 
 ```
-├── CLAUDE.md
-├── .env
-├── docs/
-│   ├── ARCHITECTURE.md
-│   ├── SCHEMA.md
-│   ├── WEAVIATE.md
-│   └── PROMPTS.md
 ├── shared/
-│   ├── __init__.py
-│   ├── config.py                     # Secrets from .env + all configuration constants
+│   ├── config.py                      # All config constants
 │   ├── services/
-│   │   ├── __init__.py
-│   │   ├── anthropic.py              # Claude API client wrapper
-│   │   └── redshift.py               # Redshift connection and query helpers
+│   │   ├── anthropic.py               # Claude client (thread-safe, semaphore, per-thread client)
+│   │   ├── redshift.py                # psycopg2 helpers + ThreadedConnectionPool
+│   │   └── weaviate.py                # Weaviate v4 client (all 3 collections)
 │   ├── prompts/
-│   │   ├── __init__.py
-│   │   ├── fields.py                 # Valid values for natures, intents, sentiments + validation helpers
-│   │   └── extraction.py             # Extraction prompt template (Prompt 1), imports from fields.py
-│   └── pipeline/
-│       ├── __init__.py
-│       └── extraction.py             # Step 1 logic: read transcripts, call Claude, persist results
+│   │   ├── fields.py                  # NATURES, INTENTS, SENTIMENTS with descriptions
+│   │   ├── extraction.py              # Prompt 1 — transcript → issues
+│   │   ├── validation.py              # Prompt 2 — Band B arbitration (approved + pending)
+│   │   ├── new_subtopic.py            # Prompt 3 — Band C new subtopic proposal
+│   │   ├── centroid_update.py         # Prompt 4 — centroid regeneration
+│   │   ├── reprocess.py               # Segment description reprocessing prompt
+│   │   └── product_areas.py           # Static product area definitions
+│   ├── pipeline/
+│   │   ├── extraction.py              # Phase 1: parallel extraction (FIRST_COMPLETED)
+│   │   ├── classification.py          # Phase 2: Band A/B/C routing + candidate creation
+│   │   ├── review.py                  # Phase 2: approve/reject/merge candidates
+│   │   ├── maintenance.py             # Phase 2: centroid update + duplicate detection
+│   │   ├── vectorize.py               # Weaviate bulk sync from Redshift
+│   │   └── reprocess.py               # Reprocess segment_descriptions via Claude
+│   └── lib/
+│       └── clustering.py              # cluster_by_proposal (legacy, kept for fallback)
 ├── backend/
-│   ├── app/
-│   │   ├── __init__.py
-│   │   ├── main.py                   # FastAPI app entry point
-│   │   └── routes/
-│   │       ├── __init__.py
-│   │       ├── pipeline.py           # POST /api/pipeline/extract
-│   │       ├── status.py             # GET /api/status/overview
-│   │       ├── transcripts.py        # GET /api/transcripts, GET /api/transcripts/{id}
-│   │       └── issues.py             # GET /api/issues, GET /api/issues/{id}
-│   └── requirements.txt
+│   ├── requirements.txt
+│   └── app/
+│       ├── main.py
+│       └── routes/
+│           ├── pipeline.py            # extract/stream, classify/stream, vectorize, log
+│           ├── status.py              # overview counts
+│           ├── transcripts.py         # list + detail
+│           ├── issues.py              # list + detail + reprocess + reprocess-logs
+│           ├── logs.py                # extraction audit log
+│           ├── classification_logs.py # classification audit log
+│           ├── candidates.py          # review queue (approve/reject/merge)
+│           ├── taxonomy.py            # tree, topics, subtopics, uncategorized
+│           ├── review.py              # topic/subtopic merge, move, delete, issue reassignment
+│           ├── maintenance.py         # centroids, duplicates
+│           └── weaviate.py            # setup, migrate, sync, status
 ├── frontend/
-│   ├── package.json
-│   ├── vite.config.js
-│   ├── src/
-│   │   ├── App.jsx                   # Layout with sidebar navigation
-│   │   ├── api/
-│   │   │   └── client.js             # Fetch wrapper for /api/* endpoints
-│   │   ├── pages/
-│   │   │   ├── Dashboard.jsx         # Overview counts and recent activity
-│   │   │   ├── Pipeline.jsx          # Trigger extraction, view progress
-│   │   │   ├── Transcripts.jsx       # Browse transcripts
-│   │   │   └── Issues.jsx            # Browse extracted issues
-│   │   └── components/               # Shared UI components
-│   └── index.html
-└── tests/
-    └── shared/
+│   └── src/
+│       ├── App.jsx                    # Sidebar nav + routes
+│       ├── api/client.js              # All API calls
+│       ├── pages/
+│       │   ├── Dashboard.jsx
+│       │   ├── Pipeline.jsx           # Extraction with live SSE log
+│       │   ├── Transcripts.jsx
+│       │   ├── Issues.jsx             # With bulk reprocess
+│       │   ├── Logs.jsx               # Extraction audit log
+│       │   ├── ClassificationLogs.jsx # Classification audit log
+│       │   ├── taxonomy/
+│       │   │   ├── ProcessTopics.jsx  # Classify + review queue
+│       │   │   ├── ReviewTopics.jsx   # Edit, merge, move, delete topics & subtopics
+│       │   │   └── ViewTopics.jsx     # Browse taxonomy tree (read-only)
+│       │   └── weaviate/
+│       │       ├── Setup.jsx          # Collections status + migrate
+│       │       ├── SyncIssues.jsx
+│       │       └── SyncTranscripts.jsx
+│       └── components/
+│           ├── ClassificationBadge.jsx
+│           ├── MergeModal.jsx             # Topic/subtopic merge dialog
+│           ├── ReassignModal.jsx          # Issue/subtopic reassignment dialog
+│           └── ui/                    # button, card, input, select, skeleton, table, sheet
+└── logs/
+    └── pipeline.log                   # JSON-per-line event log (RotatingFileHandler)
 ```
 
-### Phase 1 pipeline logic (Step 1 — Extraction)
+---
 
-**Trigger:** `POST /api/pipeline/extract` with optional `limit` parameter (default: 10).
+## Redshift schema (taxonomy.*)
 
-**Step 1.1 — Find unprocessed transcripts:**
-Query `taxonomy.transcripts` where `summary IS NULL`. Apply the limit. These are transcripts loaded but not yet processed by Claude.
+### Dimension tables (pre-populated)
+| Table | Rows | Key columns |
+|-------|------|-------------|
+| `product_areas` | 8 | id, name, description |
+| `natures` | 7 | id, name — Bug, Feedback, Question, Complaint, Feature Request, Exploration, Cancellation |
+| `intents` | 5 | id, name — Support, Action, Insights, Strategy, Sales |
 
-**Step 1.2 — Claude extraction:**
-For each transcript, send `raw_text` to Claude (model and temperature from `shared/config.py`: `MODEL_EXTRACTION` and `EXTRACTION_TEMPERATURE`). The prompt asks for:
-- `summary` — 2-3 sentence overview of the entire conversation
-- `issues[]` — array of distinct issues, each with:
-  - `segment_description` — normalized 1-2 sentence description in canonical register (NOT customer voice). Must read like a knowledge base topic definition. This is critical for Phase 2 vector matching quality.
-  - `verbatim_excerpt` — raw transcript portions for audit trail
-  - `nature` — one of: bug, feedback, question, complaint, feature_request, exploration
-  - `intent` — one of: support, action, insights, strategy, sales
-  - `sentiment` — one of: positive, negative, neutral, frustrated
+### Core tables
+**`transcripts`** — one row per source ticket/call
+- id, source_id (UNIQUE), source_type, community_id, title, raw_text, source_url, summary (NULL until extracted), ingested_at
 
-See `docs/PROMPTS.md` for the full prompt template and expected JSON output shape.
+**`topics`** — taxonomy level 1
+- id, product_area_id (FK, nullable), name, description, is_active, created_at
 
-**Step 1.3 — Persist results:**
-- Update the transcript row: set `summary`
-- For each issue: insert a row into `taxonomy.classified_issues` with:
-  - `transcript_id` — FK to the transcript
-  - `nature_id`, `intent_id` — mapped from string to FK by querying `taxonomy.natures` and `taxonomy.intents`
-  - `segment_description`, `verbatim_excerpt`, `sentiment` — from Claude's output
-  - `sub_topic_id` = NULL (Phase 2 fills this)
-  - `confidence_score` = NULL (Phase 2 fills this)
-  - `match_method` = NULL (Phase 2 fills this)
-  - `classification_status` = 'pending'
+**`sub_topics`** — taxonomy level 2
+- id, topic_id (FK), name, canonical_description, match_count, is_active, created_at
 
-**Error handling:**
-- Wrap Claude calls in try/catch with 3 retries and exponential backoff
-- If Claude returns invalid JSON, log the error and skip that transcript (don't crash the batch)
-- The endpoint should process transcripts sequentially and return a summary: `{"transcripts_processed": N, "issues_created": M, "errors": E}`
+**`classified_issues`** — one row per extracted issue
+- id, transcript_id (FK), extraction_log_id (FK, nullable), sub_topic_id (FK, nullable), nature_id (FK), intent_id (FK)
+- segment_description, verbatim_excerpt (JSON array string), sentiment
+- confidence_score, match_method, classification_status (pending/matched/unmatched/under_review)
+- classified_at
 
-### Phase 1 FastAPI endpoints
+**`emerging_candidates`** — proposed new subtopics pending human review
+- id, issue_ids (comma-separated), suggested_topic_name, suggested_subtopic_name
+- suggested_product_area_id (FK), canonical_description, cluster_size, avg_similarity
+- status (pending/approved/rejected), reviewed_by, created_at
+
+### Audit / log tables
+**`extraction_logs`** — one row per transcript extraction
+- id, transcript_id (FK), model, prompt_system, prompt_user, response_raw
+- issues_created, status, error_message, input_tokens, output_tokens, cost_usd, executed_at
+
+**`classification_logs`** — one row per issue classification decision
+- id, issue_id (FK), band (A/B/C/manual), decision
+- matched_subtopic_id, matched_subtopic_name, confidence_score
+- weaviate_candidates (JSON), prompt_used, claude_response
+- model_used, input_tokens, output_tokens, cost_usd, auto_create, error_message, classified_at
+
+**`issue_reprocess_logs`** — one row per segment_description reprocess
+- id, issue_id (FK), model, old_segment_description, new_segment_description
+- verbatim_excerpt, input_tokens, output_tokens, cost_usd, reprocessed_at
+
+---
+
+## Weaviate collections
+
+### SubTopic
+Vectorized field: `canonical_description`. Used by the classification pipeline for semantic matching.
+
+| Property | Type | Vectorized |
+|----------|------|-----------|
+| subtopic_id | INT | No — 0 for pending candidates |
+| candidate_id | INT | No — 0 for approved subtopics |
+| status | TEXT | No — `"approved"` or `"pending"` |
+| topic_id | INT | No |
+| product_area_id | INT | No |
+| name | TEXT | No |
+| canonical_description | TEXT | **Yes** |
+
+**Important:** Pending emerging candidates are inserted here with `status="pending"` so subsequent issues in the same batch can find them (avoiding duplicate candidates). When a candidate is approved, its entry is promoted to `status="approved"`.
+
+### ClassifiedIssue
+Vectorized field: `segment_description`. Used by RAG chat (Phase 2c).
+
+Properties: issue_id, transcript_id, sub_topic_id, topic_id, product_area_id, nature_id, intent_id, sentiment, classified_at, source_url, segment_description *(vectorized)*, verbatim_excerpt
+
+### Transcript
+Vectorized field: `raw_text`. Used by RAG chat for conversation-level search.
+
+Properties: transcript_id, source_id, source_type, community_id, title, source_url, summary, raw_text *(vectorized)*
+
+---
+
+## Phase 1 — Extraction pipeline
+
+### What it does
+1. Fetch unprocessed transcripts (`summary IS NULL`) with optional filters
+2. Send each to Claude (Prompt 1) — parallel via `ThreadPoolExecutor` + `FIRST_COMPLETED`
+3. Parse response: summary + array of issues (segment_description, verbatim_excerpt[], nature, intent, sentiment)
+4. Persist to Redshift (transcript summary + classified_issues rows)
+5. Write `extraction_logs` row with tokens/cost
+6. Emit SSE events for live UI log
+
+### Endpoints
+```
+GET  /api/pipeline/extract/stream?limit=N&nature_names=...&source_types=...&auto_create=...
+POST /api/pipeline/extract              # non-streaming version
+GET  /api/pipeline/unprocessed-count
+GET  /api/pipeline/log                  # read logs/pipeline.log
+GET  /api/status/overview
+GET  /api/transcripts
+GET  /api/transcripts/{id}
+GET  /api/issues
+GET  /api/issues/{id}
+POST /api/issues/reprocess              # bulk reprocess segment_descriptions
+GET  /api/issues/reprocess-logs
+GET  /api/logs                          # extraction audit log
+GET  /api/logs/{id}
+GET  /api/logs/models
+```
+
+### Key implementation notes
+- `verbatim_excerpt` stored as JSON array string (`["quote1", "quote2"]`)
+- `segment_description` must be in canonical register (not customer voice) — critical for vector matching
+- Parallelism: `ThreadPoolExecutor(MAX_CONCURRENCY)` + `FIRST_COMPLETED` from `concurrent.futures`
+- Claude client: one instance per thread via `threading.local()`
+- Semaphore: `threading.Semaphore(CLAUDE_MAX_CONCURRENCY)` caps in-flight calls
+- DB connections: `ThreadedConnectionPool` for parallel writes; per-call connections for routes
+- Retry: `exp_backoff` + `sleep_with_jitter` on transient errors; 400s are permanent (not retried)
+- `claude-opus-4-7` does not support `temperature` — skipped automatically
+
+---
+
+## Phase 2a — Classification pipeline
+
+### Band routing
+1. Embed issue's `segment_description`, query Weaviate `SubTopic` (includes both `approved` and `pending` entries)
+2. **Band A** (distance < 0.15): auto-assign to approved subtopic OR link to existing pending candidate
+3. **Band B** (0.15–0.35): Claude arbitration (Prompt 2) — candidates labelled as `[APPROVED]` or `[PROPOSED — pending review]`. Claude returns `type: "subtopic"|"candidate"` in response
+4. **Band C** (> 0.35 or no match): Claude proposes new subtopic (Prompt 3). If `auto_create=True`: create topic/subtopic immediately. If `auto_create=False`: create `emerging_candidate` in Redshift AND insert into Weaviate SubTopic as `status="pending"` immediately (so the next issue in the same batch can find it)
+
+Every decision writes a `classification_logs` row. Manual review actions (approve/reject/merge) write rows with `band='manual'`.
+
+### Endpoints
+```
+GET  /api/pipeline/classify/stream?limit=N&auto_create=...&nature_names=...
+GET  /api/taxonomy/tree
+GET  /api/taxonomy/topics
+GET  /api/taxonomy/topics/lookup?name=...
+GET  /api/taxonomy/topics/{id}
+GET  /api/taxonomy/subtopics/search?q=...
+GET  /api/taxonomy/subtopics/{id}
+GET  /api/taxonomy/subtopics/{id}/issues
+PUT  /api/taxonomy/subtopics/{id}
+GET  /api/taxonomy/uncategorized
+GET  /api/candidates
+GET  /api/candidates/{id}
+POST /api/candidates/{id}/approve       # body: {topic_name?, subtopic_name?, canonical_description?}
+POST /api/candidates/{id}/reject        # returns issues to pending status
+POST /api/candidates/{id}/merge         # body: {type: "candidate"|"subtopic", target_id: int}
+POST /api/maintenance/centroids
+POST /api/maintenance/duplicates
+GET  /api/classification-logs
+GET  /api/classification-logs/{id}
+```
+
+### Review queue actions
+All three actions are **fire-and-forget** — the UI removes the item immediately and shows a toast notification when the background request completes.
+
+- **Approve**: creates subtopic in Redshift, promotes Weaviate entry from `pending` → `approved` (falls back to fresh insert if no Weaviate entry found — handles pre-migration candidates)
+- **Reject**: returns all linked issues to `classification_status='pending'`, deletes Weaviate pending entry, logs `band='manual', decision='rejected_to_pending'`
+- **Merge into candidate**: appends issue_ids to target candidate, deletes source Weaviate entry, logs `merged_to_candidate`
+- **Merge into subtopic**: assigns issues to approved subtopic, deletes source Weaviate entry, logs `merged_to_subtopic`
+
+### Weaviate setup / migration
+Before first classification run:
+1. `POST /api/weaviate/setup` — creates all 3 collections
+2. `POST /api/weaviate/migrate/subtopic-status` — adds `status` + `candidate_id` to SubTopic schema, backfills existing objects with `status="approved"`
+3. `POST /api/weaviate/sync/issues` — bulk load ClassifiedIssue collection
+4. `POST /api/weaviate/sync/transcripts` — bulk load Transcript collection
+
+SubTopic is populated dynamically as candidates are created and approved — no initial bulk load needed.
+
+---
+
+## Prompts
+
+### Prompt 1 — Extraction (`shared/prompts/extraction.py`)
+- **Model:** `MODEL_EXTRACTION`, temperature 0, max_tokens 4096
+- **Input:** raw transcript text
+- **Output:** `{summary, issues: [{segment_description, verbatim_excerpt[], nature, intent, sentiment}]}`
+- **Key instruction:** segment_description must be in canonical register (system as subject, present tense, general class of problem). verbatim_excerpt is an array of strings.
+- **Format:** raw JSON, no markdown fences. Both the prompt and a code fallback (`_strip_fences`) handle the case where Claude wraps in ```json blocks.
+
+### Prompt 2 — Arbitration (`shared/prompts/validation.py`)
+- **Model:** `MODEL_ARBITRATION`, temperature 0, max_tokens 256
+- **Input:** issue description + candidates (labelled as `[APPROVED SUBTOPIC]` or `[PROPOSED — pending review]`)
+- **Output:** `{matched: true, type: "subtopic", subtopic_id: N}` or `{matched: true, type: "candidate", candidate_id: N}` or `{matched: false}`
+
+### Prompt 3 — New subtopic (`shared/prompts/new_subtopic.py`)
+- **Model:** `MODEL_NEW_SUBTOPIC` (claude-opus-4-7), no temperature, max_tokens 512
+- **Input:** issue description + existing topics list + `PRODUCT_AREAS_PROMPT_BLOCK`
+- **Output:** `{existing_topic, topic_id, topic_name, topic_description, product_area, suggested_subtopic_name, canonical_description, rationale}`
+
+### Prompt 4 — Centroid update (`shared/prompts/centroid_update.py`)
+- **Model:** `MODEL_CENTROID_UPDATE`, temperature 0.2, max_tokens 512
+- **Input:** subtopic name + current description + matched issue descriptions
+- **Output:** `{canonical_description, changes_summary}`
+
+---
+
+## Frontend — sidebar structure and pages
 
 ```
-POST /api/pipeline/extract              # Trigger extraction
-  Body: {"limit": 10}                   # Optional, defaults to 10
-  Response: {"transcripts_processed": N, "issues_created": M, "errors": E}
+Dashboard
+──────────────────
+Pipeline
+  Pipeline           # Extraction with live SSE log, filters, stop button
+  Transcripts        # Browse with expand to see raw_text + issues
+  Issues             # Browse with bulk reprocess + reprocess history
+──────────────────
+Taxonomy
+  Process Topics     # Run classification + review queue (approve/merge/reject)
+  Review Topics      # Edit, merge, move, delete topics & subtopics
+  View Topics        # Browse product areas > topics > subtopics > issues (read-only)
+──────────────────
+Weaviate
+  Setup              # Collection status + initialize + migrate schema
+  Sync Issues        # Sync ClassifiedIssue collection
+  Sync Transcripts   # Sync Transcript collection
+──────────────────
+Audit Logs
+  Extraction Log     # extraction_logs with filters, tokens, cost, prompt/response
+  Classification Log # classification_logs with band filter, Weaviate candidates view
+```
 
-GET  /api/status/overview               # Dashboard counts
+### Key UI conventions
+- **SSE streaming:** extraction and classification use `EventSource` for live log display
+- **Fire-and-forget actions:** approve/reject/merge in the review queue remove items immediately, fire API in background, show toast on completion — no spinners blocking the UI
+- **CSS hide vs unmount:** expandable components (SubtopicCandidate, TopicGroup, SubtopicDetail) use `everExpanded` + `className="hidden"` to preserve state across collapse/re-expand, avoiding redundant fetches
+- **Toast notifications:** fixed bottom-right, auto-dismiss after 4 seconds
+- **Parallel data loading:** review queue fetches all topic infos in parallel (`Promise.all`) before rendering so badges appear with the list, not after
+
+---
+
+## Review Topics — Taxonomy Governance (Phase 2a, not yet built)
+
+The Review Topics page is purpose-built for cleaning up auto-created topics: editing names, merging duplicates, reorganizing subtopics, and reassigning issues. Lives at `frontend/src/pages/taxonomy/ReviewTopics.jsx`.
+
+### Top section — taxonomy health indicators
+- Total topics count | Total subtopics count
+- Topics with only 1 subtopic (candidates for merging): count + warning badge
+- Subtopics with fewer than 3 issues (potentially too narrow): count + warning badge
+- Orphaned subtopics (topic was deleted but subtopic remains): count + warning badge
+
+### Main section — dual-panel layout
+
+Left panel shows the full topic list. Right panel shows the detail/action area for whatever is selected.
+
+**Left panel — topic list:**
+- Each topic row shows: name, product area badge, subtopic count, issue count
+- Sortable by: name, subtopic count, issue count, created date
+- Filter by: product area
+- Checkbox selection for bulk operations (multi-select topics for merge)
+- Click a topic to select it → right panel shows topic detail
+- Expand a topic to see its subtopics listed below
+- Click a subtopic → right panel switches to subtopic detail
+
+**Right panel — topic detail (when a topic is selected):**
+- Editable fields:
+  - Topic name (inline text input)
+  - Topic description (textarea)
+  - Product area (dropdown selector)
+- Save button — updates Redshift, re-syncs Weaviate for all child subtopics
+- Action buttons:
+  - **Merge topic** — opens modal (`MergeModal.jsx`): select target topic from dropdown. All subtopics under this topic move to the target. This topic is deleted. All linked Weaviate `SubTopic` and `ClassifiedIssue` records are updated.
+  - **Delete topic** — only enabled when topic has 0 subtopics. Confirmation dialog.
+- Below: list of subtopics under this topic (compact view with name + issue count)
+
+**Right panel — subtopic detail (when a subtopic is selected):**
+- Editable fields:
+  - Subtopic name (inline text input)
+  - Canonical description (textarea — triggers Weaviate re-vectorization on save)
+- Save button — updates Redshift + re-syncs Weaviate
+- Action buttons:
+  - **Move to another topic** — dropdown to select target topic. Updates `topic_id` FK in Redshift, updates `topic_id` and `product_area_id` on the Weaviate `SubTopic` record and all linked `ClassifiedIssue` records.
+  - **Merge into another subtopic** — opens modal (`MergeModal.jsx`):
+    - Search/select target subtopic
+    - Preview: "This will move N issues to [target subtopic] and delete [this subtopic]"
+    - Option to broaden the target's canonical_description (checkbox + suggested new description)
+    - Confirm → reassign all issues, combine match counts, delete this subtopic from Redshift + Weaviate, update all `ClassifiedIssue` records in Weaviate
+  - **Delete subtopic** — only enabled when subtopic has 0 matched issues. Confirmation dialog.
+- **Issues table** (below actions):
+  - All issues matched to this subtopic
+  - Columns: segment_description, nature badge, intent badge, sentiment badge
+  - Each issue has a **reassign** button (↗ icon) — opens `ReassignModal.jsx` to pick a different subtopic
+  - Checkbox selection for bulk reassignment — select multiple issues, then "Move selected to..." dropdown
+
+**Bulk operations toolbar** (appears when checkboxes are selected):
+- For topics: "Merge N selected topics into..." → dropdown to pick the surviving topic
+- For issues: "Move N selected issues to..." → dropdown to pick target subtopic
+
+### Review Topics endpoints (not yet built)
+
+```
+# Topic management
+PUT  /api/taxonomy/topics/{id}          # Edit topic name, description, product_area_id
+POST /api/taxonomy/topics/{id}/merge    # Merge topic into another
+  Body: {"target_topic_id": N}          # Moves all subtopics to target, deletes this topic
+DELETE /api/taxonomy/topics/{id}        # Delete topic (must have 0 subtopics)
+
+# Subtopic management
+POST /api/taxonomy/subtopics/{id}/move  # Move subtopic to another topic
+  Body: {"target_topic_id": N}
+POST /api/taxonomy/subtopics/{id}/merge # Merge subtopic into another
+  Body: {"target_subtopic_id": N, "broaden_description": true}
+DELETE /api/taxonomy/subtopics/{id}     # Delete subtopic (must have 0 matched issues)
+
+# Issue reassignment
+POST /api/issues/{id}/reassign          # Move a single issue to a different subtopic
+  Body: {"target_subtopic_id": N}
+POST /api/issues/bulk-reassign          # Move multiple issues at once
+  Body: {"issue_ids": [1, 2, 3], "target_subtopic_id": N}
+
+# Taxonomy health
+GET  /api/taxonomy/health               # Taxonomy quality indicators
   Response: {
-    "transcripts_total": N,
-    "transcripts_processed": N,          # WHERE summary IS NOT NULL
-    "transcripts_unprocessed": N,        # WHERE summary IS NULL
-    "issues_total": N,
-    "issues_by_status": {"pending": N, "matched": N, "unmatched": N},
-    "issues_by_nature": {"bug": N, "question": N, ...},
-    "issues_by_intent": {"support": N, "strategy": N, ...}
+    "total_topics": N,
+    "total_subtopics": N,
+    "topics_with_one_subtopic": N,
+    "subtopics_with_few_issues": N,
+    "orphaned_subtopics": N
   }
-
-GET  /api/transcripts                   # List transcripts
-  Query params: ?page=1&limit=20&status=processed|unprocessed&source_type=zendesk|fathom
-  Response: paginated list with id, source_id, source_type, title, source_url, summary, issue_count, ingested_at
-
-GET  /api/transcripts/{id}              # Transcript detail
-  Response: transcript fields + array of linked classified_issues
-
-GET  /api/issues                        # List issues
-  Query params: ?page=1&limit=20&nature=bug&intent=support&sentiment=frustrated&status=pending
-  Response: paginated list with id, segment_description, nature, intent, sentiment, classification_status, confidence_score, transcript_title
-
-GET  /api/issues/{id}                   # Issue detail
-  Response: all issue fields + parent transcript (title, source_url, summary)
 ```
 
-### Phase 1 frontend pages
+**Note:** `PUT /api/taxonomy/subtopics/{id}` already exists for editing name/description. The new endpoints above cover merge, move, delete, and reassignment operations.
 
-**Dashboard:**
-- Cards showing: total transcripts, processed count, unprocessed count, total issues extracted
-- Breakdown charts: issues by nature, issues by intent, issues by sentiment
-- Recent activity: last 20 extracted issues with timestamp
+### What merge/move/reassign operations do under the hood
 
-**Pipeline:**
-- Number input for batch limit (default 10)
-- "Run extraction" button that calls `POST /api/pipeline/extract`
-- While running: show a loading state with progress (disable the button)
-- On completion: show results summary (transcripts processed, issues created, errors)
-- Below: history of recent extraction runs (optional, can store in local state)
+**Merge topic A into topic B:**
+1. `UPDATE taxonomy.sub_topics SET topic_id = B WHERE topic_id = A`
+2. Update all affected subtopics in Weaviate `SubTopic` collection (new `topic_id`, new `product_area_id` from topic B)
+3. Update all affected issues in Weaviate `ClassifiedIssue` collection (new `topic_id`, new `product_area_id`)
+4. `DELETE FROM taxonomy.topics WHERE id = A`
+5. Log as `classification_logs` with `band='manual'`, `decision='topic_merged'`
 
-**Transcripts:**
-- Table with columns: source_type, title, summary (truncated), issues count, source_url (link), ingested_at
-- Filter by: processed/unprocessed, source_type
-- Click a row to expand and see the full summary and linked issues
+**Move subtopic from topic A to topic B:**
+1. `UPDATE taxonomy.sub_topics SET topic_id = B WHERE id = subtopic_id`
+2. Get `product_area_id` from topic B
+3. Update subtopic in Weaviate `SubTopic` collection (new `topic_id`, `product_area_id`)
+4. Update all linked issues in Weaviate `ClassifiedIssue` collection (new `topic_id`, `product_area_id`)
+5. Log as `band='manual'`, `decision='subtopic_moved'`
 
-**Issues:**
-- Table with columns: segment_description, nature (badge), intent (badge), sentiment (badge), status (badge), transcript title
-- Filters: nature, intent, sentiment, classification_status
-- Click a row to expand: shows full segment_description, verbatim_excerpt, and link to parent transcript
-- Use colored badges for nature/intent/sentiment to make scanning easy
+**Merge subtopic A into subtopic B:**
+1. `UPDATE taxonomy.classified_issues SET sub_topic_id = B WHERE sub_topic_id = A`
+2. `UPDATE taxonomy.sub_topics SET match_count = (SELECT COUNT(*) FROM classified_issues WHERE sub_topic_id = B) WHERE id = B`
+3. Update all affected issues in Weaviate `ClassifiedIssue` collection (new `sub_topic_id`)
+4. Delete subtopic A from Weaviate `SubTopic` collection
+5. `DELETE FROM taxonomy.sub_topics WHERE id = A`
+6. Optionally: ask Claude to regenerate subtopic B's `canonical_description` to cover the merged scope
+7. Log as `band='manual'`, `decision='subtopic_merged'`
 
-### Phase 1 UI design notes
+**Reassign issue from subtopic A to subtopic B:**
+1. `UPDATE taxonomy.classified_issues SET sub_topic_id = B WHERE id = issue_id`
+2. Decrement `match_count` on subtopic A, increment on subtopic B
+3. Update the issue in Weaviate `ClassifiedIssue` collection (new `sub_topic_id`, `topic_id`, `product_area_id`)
+4. Log as `band='manual'`, `decision='issue_reassigned'`
 
-- Use shadcn/ui components: Table, Badge, Button, Card, Input, Select, Dialog, Skeleton (loading states)
-- Sidebar navigation with icons for each page
-- Responsive but desktop-first (this is an internal admin tool)
-- No auth required
-- Color-code badges consistently:
-  - Nature: bug=red, question=blue, feature_request=purple, complaint=orange, feedback=teal, exploration=gray
-  - Intent: support=blue, action=green, insights=purple, strategy=amber, sales=teal
-  - Sentiment: positive=green, negative=red, neutral=gray, frustrated=orange
-  - Status: pending=gray, matched=green, unmatched=orange, under_review=blue
+**Bulk reassign** follows the same logic in a loop, wrapped in a transaction.
 
 ---
 
-## Phase 2 — Classification, Review & Taxonomy Management
+## Phase 2b — Analytics dashboard (not yet built)
 
-Phase 2 adds Weaviate for subtopic matching, the classification pipeline (Step 2), the review queue (Step 3), centroid maintenance (Step 4), and taxonomy browsing.
+**Purpose:** Let users explore classified data through filtered aggregations on the Explore page. Pure Redshift queries, no AI.
 
-### What Phase 2 adds to the project structure
+## Phase 2c — Conversational RAG chat (not yet built)
 
-```
-shared/
-  ├── services/
-  │   └── weaviate.py                 # NEW: Weaviate client wrapper
-  ├── prompts/
-  │   ├── product_areas.py            # NEW: Static product area definitions
-  │   ├── validation.py               # NEW: Ambiguous match arbitration prompt (Prompt 2)
-  │   ├── new_subtopic.py             # NEW: New subtopic proposal prompt (Prompt 3)
-  │   └── centroid_update.py          # NEW: Centroid regeneration prompt (Prompt 4)
-  ├── pipeline/
-  │   ├── classification.py           # NEW: Step 2 logic
-  │   ├── review.py                   # NEW: Step 3 logic
-  │   └── maintenance.py              # NEW: Step 4 logic
-  └── lib/
-      ├── __init__.py                 # NEW
-      ├── embedding.py                # NEW: Embedding generation
-      ├── clustering.py               # NEW: Pairwise similarity and clustering
-      └── thresholds.py               # NEW: Confidence band configuration
+**Purpose:** Chat sidebar on the Explore page. Queries Weaviate `ClassifiedIssue` and `Transcript` collections with active filters, retrieves relevant context, streams Claude responses with source attribution.
 
-backend/
-  └── app/routes/
-      ├── candidates.py               # NEW: Review queue endpoints
-      ├── taxonomy.py                 # NEW: Taxonomy browsing endpoints
-      └── maintenance.py              # NEW: Centroid maintenance endpoints
-
-frontend/
-  └── src/pages/
-      ├── Candidates.jsx              # NEW: Review queue page
-      └── Taxonomy.jsx                # NEW: Taxonomy tree browser
-```
-
-### Phase 2 pipeline logic
-
-**Step 2 — Classification** (`POST /api/pipeline/classify`):
-- Read all `classified_issues` where `classification_status = 'pending'`
-- For each issue, embed `segment_description` and query Weaviate for top 5 nearest subtopics
-- Route through confidence bands:
-  - Band A (distance < `BAND_A_CEILING`): auto-assign subtopic, `match_method = 'vector_direct'`
-  - Band B (distance `BAND_A_CEILING`–`BAND_B_CEILING`): send candidates to Claude for arbitration (Prompt 2, `MODEL_ARBITRATION`), `match_method = 'llm_confirmed'`
-  - Band C (distance > `BAND_B_CEILING`): propose new subtopic via Claude (Prompt 3, `MODEL_NEW_SUBTOPIC`), `match_method = 'new_subtopic'`
-- Cluster unmatched issues (similarity > 0.85) into `taxonomy.emerging_candidates`
-
-**Step 3 — Review & Approval** (via UI):
-- `POST /api/candidates/{id}/approve` — create subtopic in Redshift + Weaviate, backfill linked issues
-- `POST /api/candidates/{id}/reject` — merge linked issues into existing subtopic selected by reviewer
-- After any approval, offer to re-run classification on remaining unmatched issues
-
-**Step 4 — Centroid Maintenance** (`POST /api/maintenance/centroids`):
-- For subtopics with significant new matches, regenerate `canonical_description` from accumulated issue descriptions (Prompt 4, `MODEL_CENTROID_UPDATE`)
-- Update in Redshift and re-sync to Weaviate
-- Run duplicate detection: flag subtopic pairs with distance < 0.15
-
-### Phase 2 new endpoints
-
-```
-POST /api/pipeline/classify             # Trigger Step 2
-GET  /api/candidates                    # List pending candidates
-GET  /api/candidates/{id}               # Candidate detail with linked issues
-POST /api/candidates/{id}/approve       # Approve (with optional edits in body)
-POST /api/candidates/{id}/reject        # Reject (body: {"merge_into_subtopic_id": N})
-GET  /api/taxonomy/tree                 # Full tree: product_area > topic > subtopic
-GET  /api/taxonomy/topics               # List topics
-GET  /api/taxonomy/subtopics/{id}       # Subtopic detail
-PUT  /api/taxonomy/subtopics/{id}       # Edit subtopic (triggers Weaviate re-sync)
-POST /api/maintenance/centroids         # Trigger centroid regeneration
-POST /api/maintenance/duplicates        # Trigger duplicate detection
-```
-
-### Phase 2 new frontend pages
-
-**Candidates** — review queue:
-- Table of pending candidates: suggested topic, subtopic, canonical_description, cluster_size, avg_similarity
-- Expand to see linked issues with their segment_descriptions and verbatim_excerpts
-- Approve button (creates subtopic as-is)
-- Approve with edits (inline edit name and description before creating)
-- Reject button (opens modal to select existing subtopic to merge into)
-
-**Taxonomy** — tree browser:
-- Collapsible tree: product_area > topic > subtopic
-- Each subtopic shows match_count and canonical_description
-- Click to edit description (calls PUT endpoint, triggers Weaviate re-sync)
-
-### Phase 2 model assignments per prompt
-
-All models are defined in `shared/config.py`. Change them there, nowhere else.
-
-| Prompt | Config constant | Default value | Reason |
-|--------|----------------|---------------|--------|
-| Prompt 1 — Extraction | `MODEL_EXTRACTION` | claude-sonnet-4-20250514 | High volume, structured task |
-| Prompt 2 — Arbitration | `MODEL_ARBITRATION` | claude-sonnet-4-20250514 | Simple decision, short context |
-| Prompt 3 — New subtopic | `MODEL_NEW_SUBTOPIC` | claude-opus-4-6-20250415 | Low volume, high impact, needs reasoning depth |
-| Prompt 4 — Centroid update | `MODEL_CENTROID_UPDATE` | claude-sonnet-4-20250514 | Low stakes, runs periodically |
+See `docs/ARCHITECTURE.md` and `docs/PROMPTS.md` for full specs on Phase 2b and 2c.
 
 ---
 
-## Key conventions (both phases)
+## Key conventions
 
-- **API keys** are loaded from `.env` via `shared/config.py`. Never hardcoded.
-- **Models, thresholds, and batch limits** are defined in `shared/config.py`, not in `.env`. They are not secrets and should be version-controlled.
-- **Redshift is the source of truth.** Weaviate (Phase 2) is a search index synced from Redshift.
-- **segment_description must be in canonical register** — like a topic definition, not customer voice. This is critical for Phase 2 vector matching quality, so it must be right from Phase 1.
-- **sub_topic_id on classified_issues is nullable** — Phase 1 leaves it NULL for all issues. Phase 2 fills it.
-- **Product areas are a static constant** in `shared/prompts/product_areas.py` (Phase 2). Not queried from DB.
-- **Transcripts are closed tickets only** — no re-processing. Deduplication by `source_id`.
-- **shared/ has no dependency on FastAPI** — pure Python. FastAPI routes are thin wrappers that call shared functions.
-- **Pipeline functions return result dicts** — the FastAPI route passes them through as JSON responses. No HTTP logic in shared/.
+- **API keys** from `.env` via `shared/config.py`. Never hardcoded.
+- **Models and thresholds** in `shared/config.py`. Change one file.
+- **Redshift is source of truth.** Weaviate is a derived search index.
+- **shared/ has no FastAPI dependency.** Routes are thin wrappers.
+- **Pipeline functions return dicts.** Routes pass them through as JSON.
+- **segment_description in canonical register** — system as subject, present tense, general class of problem. Critical for vector matching quality.
+- **verbatim_excerpt is a JSON array string** — parse with `parseVerbatim()` in frontend, `_serialize_verbatim()` in backend.
+- **classification_logs band='manual'** — used for human review actions (approve/reject/merge) to distinguish from automated pipeline decisions.
+- **Weaviate SubTopic dual-status** — pending candidates live in the same collection as approved subtopics. Query always returns both; routing logic uses the `status` field to decide the action.
 
 ## Reference docs
 
-- `docs/ARCHITECTURE.md` — full pipeline spec with examples and rationale
-- `docs/SCHEMA.md` — Redshift table definitions and relationships
-- `docs/WEAVIATE.md` — Weaviate collection schema and query patterns (Phase 2)
-- `docs/PROMPTS.md` — Claude prompt templates and product area constants
+- `docs/ARCHITECTURE.md` — original pipeline spec
+- `docs/SCHEMA.md` — Redshift table definitions
+- `docs/WEAVIATE.md` — Weaviate collection patterns (v3 style — actual code uses v4)
+- `docs/PROMPTS.md` — original prompt templates
+- `docs/PARALLELISM_GUIDE.md` — parallelism implementation reference

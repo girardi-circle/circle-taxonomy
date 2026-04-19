@@ -2,7 +2,7 @@
 
 ## Redshift Schema: `taxonomy`
 
-This document describes the Redshift tables, their purpose, relationships, and important constraints.
+All tables live in the `taxonomy` schema in the `dev` database. Redshift is the source of truth — Weaviate is a derived search index.
 
 ---
 
@@ -13,6 +13,11 @@ product_areas ──< topics ──< sub_topics ──< classified_issues >─�
                                                     │           >── intents
                                                     │
                                               transcripts
+                                                    │
+                                         extraction_logs ──────< classified_issues (extraction_log_id)
+
+classified_issues ──< classification_logs
+classified_issues ──< issue_reprocess_logs
 
 emerging_candidates ──> product_areas (suggested)
                     ──> classified_issues (via issue_ids)
@@ -20,184 +25,201 @@ emerging_candidates ──> product_areas (suggested)
 
 ---
 
-## Table: taxonomy.product_areas
+## Dimension tables
 
-Stable dimension. Defines the product/engineering teams that own topic categories.
+### taxonomy.product_areas
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | INT | PK, IDENTITY | |
-| name | VARCHAR(100) | NOT NULL, UNIQUE | e.g. "CMS", "Live", "Paywalls", "Growth" |
-| description | VARCHAR(2000) | | Team scope and ownership definition |
-| slack_channel | VARCHAR(100) | | Slack channel for alerts and routing |
+| Column | Type | Constraints |
+|--------|------|-------------|
+| id | INT | PK, IDENTITY |
+| name | VARCHAR(100) | NOT NULL, UNIQUE |
+| description | VARCHAR(2000) | |
+| slack_channel | VARCHAR(100) | |
 
-Expected row count: 8. Rarely changes. Current values: CMS, Live, Paywalls, Growth, CRM, Email Hub, Apps, Circle Plus.
+Values: CMS, Live, Paywalls, Growth, CRM, Email Hub, Apps, Circle Plus.
 
-**Note:** Product area definitions (with sub-bullet coverage areas) are also maintained as a static Python constant in `shared/prompts/product_areas.py` for prompt injection. The database and the constant must be kept in sync manually.
+### taxonomy.natures
 
----
+| Column | Type | Constraints |
+|--------|------|-------------|
+| id | INT | PK, IDENTITY |
+| name | VARCHAR(50) | NOT NULL, UNIQUE |
+| description | VARCHAR(255) | |
 
-## Table: taxonomy.natures
+Values: Bug, Feedback, Question, Complaint, Feature Request, Exploration, Cancellation.
 
-Stable dimension. Classifies the type of issue.
+### taxonomy.intents
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | INT | PK, IDENTITY | |
-| name | VARCHAR(50) | NOT NULL, UNIQUE | Bug, Feedback, Question, Complaint, Feature Request, Exploration |
-| description | VARCHAR(255) | | Human-readable definition of this nature |
+| Column | Type | Constraints |
+|--------|------|-------------|
+| id | INT | PK, IDENTITY |
+| name | VARCHAR(50) | NOT NULL, UNIQUE |
+| description | VARCHAR(255) | |
 
-Expected row count: 6. Fixed vocabulary.
-
----
-
-## Table: taxonomy.intents
-
-Stable dimension. Classifies why the customer is raising the issue.
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | INT | PK, IDENTITY | |
-| name | VARCHAR(50) | NOT NULL, UNIQUE | Support, Action, Insights, Strategy, Sales |
-| description | VARCHAR(255) | | Human-readable definition of this intent |
-
-Expected row count: 5. Fixed vocabulary.
+Values: Support, Action, Insights, Strategy, Sales.
 
 ---
 
-## Table: taxonomy.topics
+## Core tables
 
-Top-level topic categories. Controlled vocabulary — grows slowly, ideally curated by humans.
+### taxonomy.topics
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | INT | PK, IDENTITY | |
-| product_area_id | INT | FK → product_areas, **NULLABLE** | Nullable to allow topics before product areas are fully defined |
-| name | VARCHAR(255) | NOT NULL | e.g. "Website Builder", "Events", "Paywall Management" |
-| description | VARCHAR(1000) | | What this topic category covers |
-| created_at | TIMESTAMP | DEFAULT GETDATE() | |
-| is_active | BOOLEAN | DEFAULT TRUE | Soft delete flag |
+Top-level topic categories.
 
-Expected row count: 15-30. Product area is enforced here and inherited by all child subtopics.
+| Column | Type | Constraints |
+|--------|------|-------------|
+| id | INT | PK, IDENTITY |
+| product_area_id | INT | FK → product_areas, **NULLABLE** |
+| name | VARCHAR(255) | NOT NULL |
+| description | VARCHAR(1000) | |
+| created_at | TIMESTAMP | DEFAULT GETDATE() |
+| is_active | BOOLEAN | DEFAULT TRUE |
 
----
+### taxonomy.sub_topics
 
-## Table: taxonomy.sub_topics
+Specific issue categories under each topic. Vectorized in Weaviate `SubTopic` collection.
 
-Specific issue categories under each topic. This is the entity that Weaviate indexes for vector matching.
+| Column | Type | Constraints |
+|--------|------|-------------|
+| id | INT | PK, IDENTITY |
+| topic_id | INT | FK → topics, NOT NULL |
+| name | VARCHAR(255) | NOT NULL |
+| canonical_description | VARCHAR(2000) | Primary vector field in Weaviate |
+| match_count | INT | DEFAULT 0 |
+| created_at | TIMESTAMP | DEFAULT GETDATE() |
+| is_active | BOOLEAN | DEFAULT TRUE |
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | INT | PK, IDENTITY | |
-| topic_id | INT | FK → topics, NOT NULL | Parent topic |
-| name | VARCHAR(255) | NOT NULL | e.g. "Drag-and-drop component render failure" |
-| canonical_description | VARCHAR(2000) | | **Primary vector field.** Normalized description synced to Weaviate. Must be written in canonical register, not customer voice. |
-| match_count | INT | DEFAULT 0 | Number of classified issues matched to this subtopic. Incremented by Step 2. |
-| created_at | TIMESTAMP | DEFAULT GETDATE() | |
-| is_active | BOOLEAN | DEFAULT TRUE | Soft delete flag |
+### taxonomy.transcripts
 
-Expected row count: 50-500+, growing as new issues are discovered. `canonical_description` evolves over time via Step 4 (centroid maintenance).
+One row per source record (Zendesk ticket, Fathom call).
 
----
+| Column | Type | Constraints |
+|--------|------|-------------|
+| id | INT | PK, IDENTITY |
+| source_id | VARCHAR(255) | NOT NULL, UNIQUE |
+| source_type | VARCHAR(50) | NOT NULL — 'zendesk', 'fathom' |
+| community_id | INT | NULLABLE |
+| title | VARCHAR(255) | NULLABLE |
+| raw_text | VARCHAR(65535) | Full transcript text |
+| source_url | VARCHAR(255) | NULLABLE |
+| summary | VARCHAR(2000) | NULL until Step 1 fills it |
+| ingested_at | TIMESTAMP | DEFAULT GETDATE() |
 
-## Table: taxonomy.transcripts
+**`summary IS NULL`** = unprocessed. The extraction pipeline queries on this condition.
 
-One row per source record. Stores the raw input and transcript-level AI extractions.
+### taxonomy.classified_issues
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | INT | PK, IDENTITY | |
-| source_id | VARCHAR(255) | NOT NULL, UNIQUE | Source system ID (Zendesk ticket ID, Fathom call ID) |
-| source_type | VARCHAR(50) | NOT NULL | 'zendesk', 'fathom', 'slack' |
-| community_id | INT | NULLABLE | Circle community ID associated with this transcript |
-| title | VARCHAR(255) | NULLABLE | Ticket subject or call title |
-| raw_text | VARCHAR(65535) | | Full raw transcript text |
-| source_url | VARCHAR(255) | NULLABLE | Link back to the source (Zendesk ticket URL, Fathom recording) |
-| summary | VARCHAR(2000) | | Claude-generated overview of the entire conversation. NULL until Step 1 processes it. |
-| ingested_at | TIMESTAMP | DEFAULT GETDATE() | |
+One row per distinct issue extracted from a transcript. Core analytical table.
 
-**Important:** This table holds no classification data. Classification lives on `classified_issues`. One transcript produces one or more classified issues.
+| Column | Type | Constraints |
+|--------|------|-------------|
+| id | INT | PK, IDENTITY |
+| transcript_id | INT | FK → transcripts, NOT NULL |
+| extraction_log_id | INT | FK → extraction_logs, NULLABLE |
+| sub_topic_id | INT | FK → sub_topics, **NULLABLE** |
+| nature_id | INT | FK → natures, NOT NULL |
+| intent_id | INT | FK → intents, NOT NULL |
+| segment_description | VARCHAR(2000) | Canonical-register description. Used for Weaviate embedding. |
+| verbatim_excerpt | VARCHAR(65535) | **JSON array string** — `["quote1", "quote2", ...]` |
+| sentiment | VARCHAR(20) | positive, negative, neutral, frustrated |
+| confidence_score | FLOAT | 1 - weaviate_distance. NULL until classified. |
+| match_method | VARCHAR(20) | vector_direct, llm_confirmed, new_subtopic. NULL until classified. |
+| classification_status | VARCHAR(20) | DEFAULT 'pending' |
+| classified_at | TIMESTAMP | DEFAULT GETDATE() |
 
-**Deduplication:** Uses `source_id` with a UNIQUE constraint. Since we only process closed tickets, there are no updates to handle — each ticket is ingested once.
+**Status lifecycle:** `pending` → `matched` / `unmatched` / `under_review`
 
-**Pre-populated:** This table is loaded from `circle.dbt_daniel.int_control_studio__conversations_unioned` before the pipeline runs. The `summary` column is NULL until Step 1 fills it.
+**Important:** `verbatim_excerpt` is stored as a JSON array string. Parse with `JSON.parse()` in frontend, `json.loads()` in backend. Never treat as plain text.
 
----
+### taxonomy.emerging_candidates
 
-## Table: taxonomy.classified_issues
+Review queue for proposed new subtopics. Also maintained in Weaviate `SubTopic` with `status="pending"`.
 
-One row per distinct issue extracted from a transcript. This is the core analytical table.
+| Column | Type | Constraints |
+|--------|------|-------------|
+| id | INT | PK, IDENTITY |
+| issue_ids | VARCHAR(2000) | Comma-separated classified_issue IDs |
+| suggested_topic_name | VARCHAR(255) | |
+| suggested_subtopic_name | VARCHAR(255) | |
+| suggested_product_area_id | INT | FK → product_areas, NULLABLE |
+| canonical_description | VARCHAR(2000) | |
+| cluster_size | INT | |
+| avg_similarity | FLOAT | |
+| status | VARCHAR(20) | DEFAULT 'pending' — pending, approved, rejected |
+| reviewed_by | VARCHAR(100) | |
+| created_at | TIMESTAMP | DEFAULT GETDATE() |
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | INT | PK, IDENTITY | |
-| transcript_id | INT | FK → transcripts, NOT NULL | Source transcript |
-| sub_topic_id | INT | FK → sub_topics, **NULLABLE** | NULL when pending classification or awaiting new subtopic approval |
-| nature_id | INT | FK → natures, NOT NULL | Bug, Question, etc. — set during extraction |
-| intent_id | INT | FK → intents, NOT NULL | Support, Strategy, etc. — set during extraction |
-| segment_description | VARCHAR(2000) | | Normalized issue description. Used for vector embedding and Weaviate matching. Written in canonical register. |
-| verbatim_excerpt | VARCHAR(65535) | | Raw transcript portion for this issue. Audit trail only — not used for matching. |
-| sentiment | VARCHAR(20) | | Per-issue sentiment: positive, negative, neutral, frustrated |
-| confidence_score | FLOAT | | 1 - weaviate_distance. NULL until classified. |
-| match_method | VARCHAR(20) | | 'vector_direct', 'llm_confirmed', 'new_subtopic'. NULL until classified. |
-| classification_status | VARCHAR(20) | DEFAULT 'pending' | 'pending', 'matched', 'unmatched', 'under_review' |
-| classified_at | TIMESTAMP | DEFAULT GETDATE() | |
-
-**Status lifecycle:**
-- `pending` — created by Step 1, waiting for Step 2 to classify
-- `matched` — Step 2 found a subtopic match (direct or LLM-confirmed)
-- `unmatched` — Step 2 found no match, emerging candidate created
-- `under_review` — linked to an emerging candidate being reviewed
-
-**Query patterns:**
-- Step 2 reads: `WHERE classification_status = 'pending'`
-- Reclassification reads: `WHERE classification_status IN ('pending', 'unmatched')`
-- Analytics: `GROUP BY sub_topic_id, nature_id, intent_id` for any dimensional breakdown
-
-**Navigating to product area from an issue:**
-```sql
-SELECT ci.*, t.name AS topic, st.name AS subtopic, pa.name AS product_area
-FROM taxonomy.classified_issues ci
-JOIN taxonomy.sub_topics st ON ci.sub_topic_id = st.id
-JOIN taxonomy.topics t ON st.topic_id = t.id
-LEFT JOIN taxonomy.product_areas pa ON t.product_area_id = pa.id;
-```
+**Important:** When a candidate is created, it is immediately inserted into Weaviate `SubTopic` with `status="pending"` and `candidate_id=<id>`. This allows subsequent issues in the same classification batch to find it semantically and link to it rather than creating a duplicate candidate.
 
 ---
 
-## Table: taxonomy.axioms
+## Audit / log tables
 
-Business rules stored as data. Not used in initial rollout — reserved for future routing and alerting automation.
+### taxonomy.extraction_logs
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | INT | PK, IDENTITY | |
-| rule_name | VARCHAR(100) | NOT NULL | Human-readable rule identifier |
-| description | VARCHAR(500) | | What this rule does |
-| condition_json | VARCHAR(2000) | NOT NULL | JSON condition. e.g. `{"nature":"Bug","intent":"Support"}` |
-| action_json | VARCHAR(2000) | NOT NULL | JSON action. e.g. `{"priority":"high","alert_slack":"#channel"}` |
-| is_active | BOOLEAN | DEFAULT TRUE | Enable/disable without deleting |
+One row per transcript processed by the extraction pipeline.
+
+| Column | Type |
+|--------|------|
+| id | INT PK IDENTITY |
+| transcript_id | INT FK → transcripts |
+| model | VARCHAR(100) |
+| prompt_system | VARCHAR(2000) |
+| prompt_user | VARCHAR(4000) — with `[transcript_raw_text]` placeholder |
+| response_raw | VARCHAR(65535) |
+| issues_created | INT |
+| status | VARCHAR(20) — success, error |
+| error_message | VARCHAR(2000) |
+| input_tokens | INT |
+| output_tokens | INT |
+| cost_usd | FLOAT |
+| executed_at | TIMESTAMP DEFAULT GETDATE() |
+
+### taxonomy.classification_logs
+
+One row per issue classification decision. Covers both automated pipeline decisions and manual review actions.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | INT PK IDENTITY | |
+| issue_id | INT FK → classified_issues | |
+| band | VARCHAR(10) | A, B, C, or **manual** (for review actions) |
+| decision | VARCHAR(30) | matched, auto_created, unmatched, linked_to_candidate, rejected_to_C, rejected_to_pending, merged_to_candidate, merged_to_subtopic, error |
+| matched_subtopic_id | INT | |
+| matched_subtopic_name | VARCHAR(255) | |
+| confidence_score | FLOAT | |
+| weaviate_candidates | VARCHAR(4000) | JSON array of top candidates with distances |
+| prompt_used | VARCHAR(65535) | Full prompt sent to Claude (Band B/C only) |
+| claude_response | VARCHAR(4000) | Raw Claude JSON response |
+| model_used | VARCHAR(100) | NULL for Band A and manual actions |
+| input_tokens | INT | |
+| output_tokens | INT | |
+| cost_usd | FLOAT | |
+| auto_create | BOOLEAN | |
+| error_message | VARCHAR(2000) | |
+| classified_at | TIMESTAMP DEFAULT GETDATE() | |
+
+**`band='manual'`** is used for human review actions (approve/reject/merge) to distinguish from automated pipeline decisions.
+
+### taxonomy.issue_reprocess_logs
+
+One row per segment_description reprocessing operation.
+
+| Column | Type |
+|--------|------|
+| id | INT PK IDENTITY |
+| issue_id | INT FK → classified_issues |
+| model | VARCHAR(100) |
+| old_segment_description | VARCHAR(2000) |
+| new_segment_description | VARCHAR(2000) |
+| verbatim_excerpt | VARCHAR(65535) |
+| input_tokens | INT |
+| output_tokens | INT |
+| cost_usd | FLOAT |
+| reprocessed_at | TIMESTAMP DEFAULT GETDATE() |
 
 ---
 
-## Table: taxonomy.emerging_candidates
+## Unused tables (reserved for future phases)
 
-Review queue for proposed new subtopics. Populated by Step 2 when issues don't match existing subtopics.
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | INT | PK, IDENTITY | |
-| issue_ids | VARCHAR(2000) | | Comma-separated classified_issue IDs that triggered this candidate |
-| suggested_topic_name | VARCHAR(255) | | Claude's proposed topic (may be existing or new) |
-| suggested_subtopic_name | VARCHAR(255) | | Claude's proposed subtopic name |
-| suggested_product_area_id | INT | FK → product_areas, NULLABLE | Inherited from existing topic if applicable |
-| canonical_description | VARCHAR(2000) | | Proposed description — ready to sync to Weaviate if approved |
-| cluster_size | INT | | Number of similar unmatched issues grouped into this candidate |
-| avg_similarity | FLOAT | | Average pairwise similarity within the cluster |
-| status | VARCHAR(20) | DEFAULT 'pending' | pending, approved, rejected |
-| reviewed_by | VARCHAR(100) | | Who approved/rejected |
-| created_at | TIMESTAMP | DEFAULT GETDATE() | |
-
-**Approval flow:**
-- `approved` → create subtopic in Redshift + Weaviate, backfill linked issues
-- `rejected` → merge linked issues into an existing subtopic selected by reviewer
+- `taxonomy.axioms` — business rules engine (not yet used)
