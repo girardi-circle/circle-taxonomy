@@ -212,7 +212,7 @@ Respond with valid JSON only:
 **Temperature:** 0.2
 **Max tokens:** 512
 
-**Purpose:** Regenerate a subtopic's canonical description from accumulated matched issues to strengthen its vector representation over time.
+**Purpose:** Regenerate a subtopic's canonical description from accumulated matched issues to strengthen its vector representation over time. Also triggered **automatically** by `_run_centroid_for_subtopic()` after every merge_subtopic and merge_topic governance operation (requires ≥ 3 matched issues; skippable via `run_centroid=False`).
 
 **System:**
 ```
@@ -280,6 +280,48 @@ VERBATIM EXCERPT:
 
 Respond with valid JSON only: {"segment_description": "..."}
 ```
+
+---
+
+## Prompt 6: Taxonomy AI Review
+
+**File:** `shared/prompts/taxonomy_review.py`  
+**Model:** `MODEL_NEW_SUBTOPIC` (claude-opus-4-7)  
+**Temperature:** not set (claude-opus-4-7 does not accept temperature)  
+**Max tokens:** 16000
+
+**Purpose:** Analyze selected topics/subtopics and propose merges, moves, and renames. Supports two independent review modes in a single prompt — topic-level and subtopic-level — allowing the user to mix both in one session.
+
+**Two review modes:**
+- **Topic-level** (`topic_ids`): evaluates each selected topic as a unit against all other existing topics. Only produces `merge_topics` and `rename_topic` suggestions. Subtopic list is included for context only.
+- **Subtopic-level** (`subtopic_ids`): evaluates each selected subtopic in full detail. Only produces `merge_subtopics`, `move_subtopic`, and `rename_subtopic` suggestions. Weaviate similarity pre-computed at < 0.25 distance is included as confirmed hints.
+
+Either or both modes may be active per request. The prompt contains up to two independent sections (Section 1 / Section 2) depending on what was selected.
+
+**Invocation:** auto-batched at `AI_REVIEW_BATCH_SIZE=10` items per list per call, `AI_REVIEW_PARALLEL_BATCHES=3` concurrent Claude calls. Results persisted to `ai_review_sessions` + `ai_review_suggestions`.
+
+**Input:**
+- `topics_for_unit_review`: topics selected as units — name, description, product area, subtopic name list
+- `subtopics_for_detail_review`: subtopics selected individually — name, canonical description, match count, up to 2 example issues, Weaviate similarity pairs (searched against ALL subtopics, not just selected)
+- `all_topics_reference`: top 200 active topics by subtopic count — optionally filtered to involved PA(s) if `restrict_to_pa=true`
+- `all_subtopics_reference`: top 500 active subtopics by match_count with PA context — optionally filtered to involved PA(s)
+
+**No-change rule:** prompt explicitly states changes are NOT mandatory. Items left unchanged must be placed in `looks_good` with a rationale explaining why no change is needed.
+
+**Output suggestion types:**
+- `merge_topics` — topic_ids, surviving_topic_id, proposed_name, proposed_description; enriched with `topic_product_areas` and `surviving_topic_pa`
+- `rename_topic` — topic_id, current_name, proposed_name, proposed_description; enriched with `topic_pa`
+- `merge_subtopics` — subtopic_ids, surviving_subtopic_id, proposed_name, proposed_description, estimated_issues; enriched with `subtopic_contexts` (topic + PA per subtopic) and `surviving_subtopic_topic_name` / `surviving_subtopic_pa`
+- `move_subtopic` — subtopic_id, from_topic_id, to_topic_id; enriched with `from_topic_pa`, `to_topic_pa`
+- `rename_subtopic` — subtopic_id, current_name, proposed_name, proposed_description; enriched with `subtopic_topic_name`, `subtopic_pa`
+
+**Output `looks_good`:** `[{type, topic_id/subtopic_id, name, rationale, pa_name, [topic_name]}]` — displayed as a tree grouped by topic in the UI
+
+---
+
+## Prompt override system
+
+All prompts are defined in `shared/prompts/store.py` with default content. Overrides are stored in `shared/prompts/overrides.json` (gitignored). At runtime, `get_system()` and `get_user_template()` return the override if one exists, otherwise the default. The **Configuration → Prompts** UI page lets users edit any prompt live and reset to defaults.
 
 ---
 

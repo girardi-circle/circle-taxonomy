@@ -3,6 +3,7 @@ import { api } from '@/api/client'
 import { Card, CardContent } from '@/components/ui/card'
 import { Select } from '@/components/ui/select'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { Sheet } from '@/components/ui/sheet'
@@ -120,6 +121,7 @@ export default function Issues() {
   const [intent, setIntent] = useState('')
   const [sentiment, setSentiment] = useState('')
   const [status, setStatus] = useState('')
+  const [issueId, setIssueId] = useState('')
   const [expanded, setExpanded] = useState(null)
   const [selected, setSelected] = useState(new Set())
   const [reprocessing, setReprocessing] = useState(false)
@@ -132,6 +134,7 @@ export default function Issues() {
     api.issues
       .list({
         page, limit,
+        issue_id: issueId ? parseInt(issueId) : undefined,
         nature: nature || undefined,
         intent: intent || undefined,
         sentiment: sentiment || undefined,
@@ -139,7 +142,7 @@ export default function Issues() {
       })
       .then((data) => { setItems(data.items); setTotal(data.total) })
       .catch((e) => setError(e.message))
-  }, [page, limit, nature, intent, sentiment, status])
+  }, [page, limit, issueId, nature, intent, sentiment, status])
 
   useEffect(() => { load() }, [load])
 
@@ -205,6 +208,15 @@ export default function Issues() {
       </Sheet>
 
       <div className="flex items-center gap-3 flex-wrap">
+        <Input
+          type="number"
+          placeholder="Issue ID"
+          value={issueId}
+          onChange={e => { setIssueId(e.target.value); setPage(1) }}
+          onKeyDown={e => e.key === 'Enter' && applyFilter()}
+          className="h-9 w-28 text-sm"
+          min={1}
+        />
         <Select value={nature} onChange={(e) => setNature(e.target.value)} className="w-40">
           <option value="">All natures</option>
           <option value="bug">Bug</option>

@@ -161,11 +161,30 @@ Candidates are grouped by `suggested_topic_name` in the UI. Each topic group sho
 
 ## 7. Step 4 — Centroid maintenance
 
-**Trigger:** `POST /api/maintenance/centroids`
+**Trigger:** `POST /api/maintenance/centroids` (manual) or **automatically** after every `merge_subtopic` / `merge_topic` governance operation.
 
-For each subtopic with significant new matches: collect all matched `segment_descriptions`, send to Claude (Prompt 4) to regenerate `canonical_description`, update Redshift + Weaviate.
+For each subtopic: collect all matched `segment_descriptions`, send to Claude (Prompt 4) to regenerate `canonical_description`, update Redshift + Weaviate. Requires ≥ 3 matched issues. The `run_centroid=False` flag skips it if needed.
 
 Also: `POST /api/maintenance/duplicates` — find subtopic pairs with vector distance < `DUPLICATE_DETECTION_THRESHOLD`.
+
+---
+
+## 9. Taxonomy governance (Review Topics)
+
+All structural operations are **soft-delete** — `is_active = FALSE` with `merged_into_id` pointing to the surviving entity. No hard DELETEs. Every operation writes to `taxonomy.taxonomy_changes`.
+
+**Operations:** merge_topic, merge_subtopic, move_subtopic, rename_topic, rename_subtopic, deactivate_topic, deactivate_subtopic.
+
+**AI Review flow:**
+1. User selects topics and/or subtopics; optional "Within Product Area only" scope confirmation when all items belong to one PA
+2. **Topic selection** → evaluated as units; only `merge_topics` / `rename_topic` suggestions produced
+3. **Subtopic selection** → Weaviate pre-computes similarity pairs (< 0.25 distance) against ALL subtopics; only `merge_subtopics` / `move_subtopic` / `rename_subtopic` suggestions produced
+4. Claude (Prompt 6) receives both lists in up to two independent sections; `AI_REVIEW_PARALLEL_BATCHES=3` concurrent Claude calls
+5. Reference lists capped at top 200 topics / top 500 subtopics by usage; optionally filtered to involved PA(s)
+6. Suggestions enriched with `PA > Topic > Subtopic` context before saving
+7. Session persisted to `ai_review_sessions` + `ai_review_suggestions`
+8. **Bulk apply:** conflict detection (merge+move same entity, survivor=source, move-dest-merged, rename-deleted) → resolution UI → grouped parallel execution (renames → moves → merges) → single `run-centroids` call for this run's applied merges only
+9. Incomplete sessions show a warning banner; dismissing uses a confirmation modal
 
 ---
 

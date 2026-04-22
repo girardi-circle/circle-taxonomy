@@ -11,6 +11,7 @@ def _build_where(
     executed_from: str | None,
     executed_to: str | None,
     model: str | None,
+    triggered_by: str | None,
     min_input_tokens: int | None,
     max_input_tokens: int | None,
     min_output_tokens: int | None,
@@ -26,6 +27,9 @@ def _build_where(
     if status:
         conditions.append("el.status = %s")
         params.append(status)
+    if triggered_by:
+        conditions.append("el.triggered_by = %s")
+        params.append(triggered_by)
     if transcript_id:
         conditions.append("el.transcript_id = %s")
         params.append(transcript_id)
@@ -85,6 +89,7 @@ def list_logs(
     executed_from: Optional[str] = None,
     executed_to: Optional[str] = None,
     model: Optional[str] = None,
+    triggered_by: Optional[str] = None,
     min_input_tokens: Optional[int] = None,
     max_input_tokens: Optional[int] = None,
     min_output_tokens: Optional[int] = None,
@@ -96,7 +101,7 @@ def list_logs(
 ):
     offset = (page - 1) * limit
     where, params = _build_where(
-        status, transcript_id, executed_from, executed_to, model,
+        status, transcript_id, executed_from, executed_to, model, triggered_by,
         min_input_tokens, max_input_tokens, min_output_tokens, max_output_tokens,
         min_cost, max_cost, min_issues, max_issues,
     )

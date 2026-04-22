@@ -12,6 +12,7 @@ def list_classification_logs(
     band: Optional[str] = None,
     decision: Optional[str] = None,
     issue_id: Optional[int] = None,
+    triggered_by: Optional[str] = None,
 ):
     offset = (page - 1) * limit
     conditions = []
@@ -26,6 +27,9 @@ def list_classification_logs(
     if issue_id:
         conditions.append("cl.issue_id = %s")
         params.append(issue_id)
+    if triggered_by:
+        conditions.append("cl.triggered_by = %s")
+        params.append(triggered_by)
 
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
@@ -40,8 +44,8 @@ def list_classification_logs(
                cl.matched_subtopic_id, cl.matched_subtopic_name,
                cl.confidence_score, cl.model_used,
                cl.input_tokens, cl.output_tokens, cl.cost_usd,
-               cl.auto_create, cl.error_message, cl.classified_at,
-               ci.segment_description
+               cl.auto_create, cl.error_message, cl.triggered_by,
+               cl.classified_at, ci.segment_description
         FROM taxonomy.classification_logs cl
         LEFT JOIN taxonomy.classified_issues ci ON cl.issue_id = ci.id
         {where}

@@ -3,8 +3,18 @@ from typing import Optional
 from pydantic import BaseModel
 from shared.services.redshift import fetch_all, fetch_one
 from shared.pipeline.reprocess import reprocess_segment_descriptions
+from shared.pipeline.taxonomy_management import reassign_issue, bulk_reassign_issues
 
 router = APIRouter()
+
+
+class ReassignRequest(BaseModel):
+    target_subtopic_id: int
+
+
+class BulkReassignRequest(BaseModel):
+    issue_ids: list[int]
+    target_subtopic_id: int
 
 
 def _build_where(
@@ -12,10 +22,14 @@ def _build_where(
     intent: str | None,
     sentiment: str | None,
     status: str | None,
+    issue_id: int | None = None,
 ) -> tuple[str, list]:
     conditions = []
     params: list = []
 
+    if issue_id is not None:
+        conditions.append("ci.id = %s")
+        params.append(issue_id)
     if nature:
         conditions.append("LOWER(n.name) = %s")
         params.append(nature.lower())
@@ -41,9 +55,10 @@ def list_issues(
     intent: Optional[str] = None,
     sentiment: Optional[str] = None,
     status: Optional[str] = None,
+    issue_id: Optional[int] = None,
 ):
     offset = (page - 1) * limit
-    where, params = _build_where(nature, intent, sentiment, status)
+    where, params = _build_where(nature, intent, sentiment, status, issue_id)
 
     total_row = fetch_all(
         f"""
@@ -146,3 +161,23 @@ def get_issue(issue_id: int):
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found")
     return issue
+
+
+@router.post("/bulk-reassign")
+def bulk_reassign(request: BulkReassignRequest):
+    try:
+        return bulk_reassign_issues(request.issue_ids, request.target_subtopic_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{issue_id}/reassign")
+def reassign(issue_id: int, request: ReassignRequest):
+    try:
+        return reassign_issue(issue_id, request.target_subtopic_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

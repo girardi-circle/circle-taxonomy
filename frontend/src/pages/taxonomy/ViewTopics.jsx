@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from 'react'
 import { api } from '@/api/client'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
@@ -402,9 +402,11 @@ export default function ViewTopics() {
 
   const filteredTopics = tree
     ? (selectedPA
-        ? (tree.find(pa => pa.id === selectedPA)?.topics || []).map(t => ({
-            ...t, product_area_name: tree.find(pa => pa.id === selectedPA)?.name,
-          }))
+        ? (() => {
+            const actualId = selectedPA === '__unassigned__' ? null : selectedPA
+            const pa = tree.find(p => p.id === actualId)
+            return (pa?.topics || []).map(t => ({ ...t, product_area_name: pa?.name || 'Unassigned' }))
+          })()
         : tree.flatMap(pa => (pa.topics || []).map(t => ({ ...t, product_area_name: pa.name }))))
         .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
     : []
@@ -434,8 +436,8 @@ export default function ViewTopics() {
             <ProductAreaCard
               key={pa.id}
               area={pa}
-              selected={selectedPA === pa.id}
-              onClick={() => setSelectedPA(selectedPA === pa.id ? null : pa.id)}
+              selected={selectedPA === (pa.id ?? '__unassigned__')}
+              onClick={() => { const id = pa.id ?? '__unassigned__'; setSelectedPA(selectedPA === id ? null : id) }}
             />
           ))}
         </div>
@@ -448,7 +450,7 @@ export default function ViewTopics() {
             Topics
             {selectedPA && tree && (
               <span className="ml-2 text-sm font-normal text-muted-foreground">
-                — {tree.find(pa => pa.id === selectedPA)?.name}
+                — {tree.find(pa => pa.id === (selectedPA === '__unassigned__' ? null : selectedPA))?.name || 'Unassigned'}
               </span>
             )}
           </h2>

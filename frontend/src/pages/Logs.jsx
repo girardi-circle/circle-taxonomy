@@ -5,17 +5,27 @@ import { Select } from '@/components/ui/select'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
+import { StatTile } from '@/components/StatTile'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { formatDate } from '@/lib/utils'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 
 const EMPTY = {
-  status: '', model: '',
+  status: '', model: '', triggered_by: '',
   executed_from: '', executed_to: '',
   min_input_tokens: '', max_input_tokens: '',
   min_output_tokens: '', max_output_tokens: '',
   min_cost: '', max_cost: '',
   min_issues: '', max_issues: '',
+}
+
+function TriggeredByBadge({ value }) {
+  if (!value || value === 'ui') return (
+    <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium bg-gray-100 text-gray-600 border-gray-200">ui</span>
+  )
+  return (
+    <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium bg-indigo-100 text-indigo-700 border-indigo-200">{value}</span>
+  )
 }
 
 function StatusPill({ value }) {
@@ -29,17 +39,6 @@ function StatusPill({ value }) {
   )
 }
 
-function StatTile({ label, main, sub }) {
-  return (
-    <Card>
-      <CardContent className="px-5 py-4">
-        <div className="text-xs text-muted-foreground mb-1">{label}</div>
-        <div className="text-2xl font-bold tabular-nums">{main ?? <Skeleton className="h-7 w-20" />}</div>
-        {sub && <div className="text-xs text-muted-foreground mt-0.5">{sub}</div>}
-      </CardContent>
-    </Card>
-  )
-}
 
 function RangeInputs({ label, minKey, maxKey, filters, setFilter, placeholder = '0' }) {
   return (
@@ -202,7 +201,7 @@ export default function Logs() {
         </button>
         {filtersOpen && <CardContent className="pt-0 pb-5 space-y-4">
           {/* Row 1: dropdowns + dates */}
-          <div className="grid grid-cols-4 gap-4">
+          <div className="grid grid-cols-5 gap-4">
             <div className="space-y-1">
               <label className="text-xs font-medium text-muted-foreground">Status</label>
               <Select value={filters.status} onChange={(e) => setFilter('status', e.target.value)} className="h-8 text-xs">
@@ -216,6 +215,14 @@ export default function Logs() {
               <Select value={filters.model} onChange={(e) => setFilter('model', e.target.value)} className="h-8 text-xs">
                 <option value="">All</option>
                 {models.map((m) => <option key={m} value={m}>{m}</option>)}
+              </Select>
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-muted-foreground">Triggered by</label>
+              <Select value={filters.triggered_by} onChange={(e) => setFilter('triggered_by', e.target.value)} className="h-8 text-xs">
+                <option value="">All</option>
+                <option value="ui">UI</option>
+                <option value="dagster">Dagster</option>
               </Select>
             </div>
             <div className="space-y-1">
@@ -296,6 +303,7 @@ export default function Logs() {
                 <TableHead>Transcript</TableHead>
                 <TableHead>Model</TableHead>
                 <TableHead>Status</TableHead>
+                <TableHead>Source</TableHead>
                 <TableHead className="text-right">Tokens in</TableHead>
                 <TableHead className="text-right">Tokens out</TableHead>
                 <TableHead className="text-right">Cost</TableHead>
@@ -306,7 +314,7 @@ export default function Logs() {
               {!items
                 ? Array.from({ length: 8 }).map((_, i) => (
                     <TableRow key={i}>
-                      <TableCell colSpan={9}><Skeleton className="h-5 w-full" /></TableCell>
+                      <TableCell colSpan={10}><Skeleton className="h-5 w-full" /></TableCell>
                     </TableRow>
                   ))
                 : items.map((log) => (
@@ -327,6 +335,7 @@ export default function Logs() {
                         </TableCell>
                         <TableCell className="text-xs text-muted-foreground">{log.model}</TableCell>
                         <TableCell><StatusPill value={log.status} /></TableCell>
+                        <TableCell><TriggeredByBadge value={log.triggered_by} /></TableCell>
                         <TableCell className="text-right tabular-nums text-xs text-muted-foreground">
                           {log.input_tokens?.toLocaleString() ?? '—'}
                         </TableCell>
@@ -342,7 +351,7 @@ export default function Logs() {
                       </TableRow>
                       {expanded === log.id && (
                         <tr key={`${log.id}-exp`}>
-                          <td colSpan={9} className="p-0">
+                          <td colSpan={10} className="p-0">
                             <ExpandedLog id={log.id} />
                           </td>
                         </tr>

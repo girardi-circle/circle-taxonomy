@@ -4,6 +4,11 @@ from typing import Optional
 
 from shared.services.redshift import fetch_all, fetch_one, execute
 from shared.services import weaviate as weaviate_service
+from shared.pipeline.taxonomy_management import (
+    get_taxonomy_health, update_topic, merge_topic, delete_topic,
+    move_subtopic, merge_subtopic, delete_subtopic_record,
+    update_subtopic as _update_subtopic_record,
+)
 
 router = APIRouter()
 
@@ -11,6 +16,26 @@ router = APIRouter()
 class UpdateSubtopicRequest(BaseModel):
     name: Optional[str] = None
     canonical_description: Optional[str] = None
+
+
+class UpdateTopicRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    product_area_id: Optional[int] = None
+
+
+class MergeTopicRequest(BaseModel):
+    target_topic_id: int
+    run_centroid: bool = True
+
+
+class MoveSubtopicRequest(BaseModel):
+    target_topic_id: int
+
+
+class MergeSubtopicRequest(BaseModel):
+    target_subtopic_id: int
+    run_centroid: bool = True
 
 
 @router.get("/tree")
@@ -389,51 +414,14 @@ def get_subtopic_issues(
 
 @router.put("/subtopics/{subtopic_id}")
 def update_subtopic(subtopic_id: int, request: UpdateSubtopicRequest):
-    """Update subtopic name and/or canonical_description. Syncs to Weaviate if description changed."""
-    existing = fetch_one(
-        "SELECT id, name, canonical_description FROM taxonomy.sub_topics WHERE id = %s",
-        (subtopic_id,),
-    )
-    if not existing:
-        raise HTTPException(status_code=404, detail="Subtopic not found")
-
-    updates = []
-    params = []
-    description_changed = False
-
-    if request.name is not None:
-        updates.append("name = %s")
-        params.append(request.name)
-
-    if request.canonical_description is not None:
-        updates.append("canonical_description = %s")
-        params.append(request.canonical_description)
-        if request.canonical_description != existing.get("canonical_description"):
-            description_changed = True
-
-    if not updates:
-        raise HTTPException(status_code=400, detail="No fields to update")
-
-    params.append(subtopic_id)
-    execute(
-        f"UPDATE taxonomy.sub_topics SET {', '.join(updates)} WHERE id = %s",
-        params,
-    )
-
-    # Sync to Weaviate if description changed
-    if description_changed:
-        try:
-            weaviate_service.update_subtopic_description(subtopic_id, request.canonical_description)
-        except Exception as e:
-            # Non-fatal: return success with a warning
-            return {
-                "id": subtopic_id,
-                "updated": True,
-                "weaviate_sync": False,
-                "weaviate_error": str(e),
-            }
-
-    return {"id": subtopic_id, "updated": True, "weaviate_sync": description_changed}
+    """Update subtopic name and/or canonical_description. Logs rename. Syncs Weaviate."""
+    try:
+        result = _update_subtopic_record(subtopic_id, request.name, request.canonical_description)
+        return {"id": subtopic_id, **result}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/uncategorized")
@@ -499,3 +487,68 @@ def get_uncategorized(
         params or None,
     )
     return {"count": row["count"] if row else 0}
+
+
+# ── Taxonomy governance endpoints ─────────────────────────────────────────────
+
+@router.get("/health")
+def taxonomy_health():
+    return get_taxonomy_health()
+
+
+@router.put("/topics/{topic_id}")
+def update_topic_endpoint(topic_id: int, request: UpdateTopicRequest):
+    try:
+        return update_topic(topic_id, request.name, request.description, request.product_area_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/topics/{topic_id}/merge")
+def merge_topic_endpoint(topic_id: int, request: MergeTopicRequest):
+    try:
+        return merge_topic(topic_id, request.target_topic_id, run_centroid=request.run_centroid)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/topics/{topic_id}")
+def delete_topic_endpoint(topic_id: int):
+    try:
+        return delete_topic(topic_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/subtopics/{subtopic_id}/move")
+def move_subtopic_endpoint(subtopic_id: int, request: MoveSubtopicRequest):
+    try:
+        return move_subtopic(subtopic_id, request.target_topic_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/subtopics/{subtopic_id}/merge")
+def merge_subtopic_endpoint(subtopic_id: int, request: MergeSubtopicRequest):
+    try:
+        return merge_subtopic(subtopic_id, request.target_subtopic_id, run_centroid=request.run_centroid)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/subtopics/{subtopic_id}")
+def delete_subtopic_endpoint(subtopic_id: int):
+    try:
+        return delete_subtopic_record(subtopic_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

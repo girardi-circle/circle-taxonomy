@@ -74,6 +74,9 @@ Top-level topic categories.
 | description | VARCHAR(1000) | |
 | created_at | TIMESTAMP | DEFAULT GETDATE() |
 | is_active | BOOLEAN | DEFAULT TRUE |
+| merged_into_id | INT | NULLABLE — set when soft-deleted via merge |
+
+**Soft-delete pattern:** Topics are never hard-deleted. On merge, `is_active = FALSE` and `merged_into_id` points to the surviving topic, preserving lineage.
 
 ### taxonomy.sub_topics
 
@@ -88,6 +91,7 @@ Specific issue categories under each topic. Vectorized in Weaviate `SubTopic` co
 | match_count | INT | DEFAULT 0 |
 | created_at | TIMESTAMP | DEFAULT GETDATE() |
 | is_active | BOOLEAN | DEFAULT TRUE |
+| merged_into_id | INT | NULLABLE — set when soft-deleted via merge |
 
 ### taxonomy.transcripts
 
@@ -173,6 +177,7 @@ One row per transcript processed by the extraction pipeline.
 | input_tokens | INT |
 | output_tokens | INT |
 | cost_usd | FLOAT |
+| triggered_by | VARCHAR(50) DEFAULT 'ui' | `'ui'` or `'dagster'` — for Dagster integration tracking |
 | executed_at | TIMESTAMP DEFAULT GETDATE() |
 
 ### taxonomy.classification_logs
@@ -195,8 +200,9 @@ One row per issue classification decision. Covers both automated pipeline decisi
 | input_tokens | INT | |
 | output_tokens | INT | |
 | cost_usd | FLOAT | |
-| auto_create | BOOLEAN | |
+| auto_create | BOOLEAN | DEFAULT FALSE |
 | error_message | VARCHAR(2000) | |
+| triggered_by | VARCHAR(50) DEFAULT 'ui' | `'ui'` or `'dagster'` — for Dagster integration tracking |
 | classified_at | TIMESTAMP DEFAULT GETDATE() | |
 
 **`band='manual'`** is used for human review actions (approve/reject/merge) to distinguish from automated pipeline decisions.
@@ -217,6 +223,53 @@ One row per segment_description reprocessing operation.
 | output_tokens | INT |
 | cost_usd | FLOAT |
 | reprocessed_at | TIMESTAMP DEFAULT GETDATE() |
+
+### taxonomy.taxonomy_changes
+
+Structural taxonomy operation audit trail. One row per merge, move, rename, or deactivation.
+
+| Column | Type |
+|--------|------|
+| id | INT PK IDENTITY |
+| action_type | VARCHAR(30) NOT NULL — merge_topic, merge_subtopic, move_subtopic, rename_topic, rename_subtopic, deactivate_topic, deactivate_subtopic |
+| entity_type | VARCHAR(10) NOT NULL — 'topic' or 'subtopic' |
+| source_id | INT NOT NULL |
+| source_name | VARCHAR(255) |
+| target_id | INT — where it was merged into / moved to |
+| target_name | VARCHAR(255) |
+| notes | VARCHAR(1000) |
+| performed_at | TIMESTAMP DEFAULT GETDATE() |
+
+### taxonomy.ai_review_sessions
+
+One row per "Review with AI" run. Persists Claude's full response so sessions can be replayed.
+
+| Column | Type |
+|--------|------|
+| id | INT PK IDENTITY |
+| topic_ids | VARCHAR(2000) — comma-separated reviewed topic IDs |
+| model | VARCHAR(100) |
+| input_tokens | INT |
+| output_tokens | INT |
+| cost_usd | FLOAT |
+| batches | INT |
+| created_at | TIMESTAMP DEFAULT GETDATE() |
+
+### taxonomy.ai_review_suggestions
+
+One row per suggestion within a session. Tracks apply/skip status.
+
+| Column | Type |
+|--------|------|
+| id | INT PK IDENTITY |
+| session_id | INT FK → ai_review_sessions |
+| suggestion_idx | INT NOT NULL |
+| suggestion_type | VARCHAR(30) — merge_subtopics, merge_topics, move_subtopic, rename_topic, rename_subtopic |
+| title | VARCHAR(255) |
+| payload | VARCHAR(4000) — full suggestion JSON |
+| status | VARCHAR(10) DEFAULT 'pending' — pending, applied, skipped |
+| applied_at | TIMESTAMP |
+| skipped_at | TIMESTAMP |
 
 ---
 

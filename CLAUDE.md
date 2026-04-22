@@ -4,7 +4,12 @@
 
 Automated ticket categorization system that classifies customer support tickets (Zendesk) and call transcripts (Fathom) into a multi-dimensional taxonomy. Each transcript is decomposed into individual issues, each classified by topic > subtopic, intent, nature, and sentiment.
 
-Built in two phases: Phase 1 covers extraction (transcripts → classified issues). Phase 2 adds Weaviate-based subtopic matching, a human review queue, and taxonomy management.
+Built in phases:
+- **Phase 1** — Extraction: transcripts → classified issues
+- **Phase 2a** — Classification pipeline: Weaviate subtopic matching, Band A/B/C routing, review queue
+- **Phase 2 governance** — Review Topics: taxonomy governance (merge, move, rename, deactivate) with soft-delete, `merged_into_id` lineage, centroid update after merge, and taxonomy_changes audit log
+- **AI Review** — Review with AI: Weaviate similarity pre-computation + Claude proposes merges/moves/renames; sessions persisted to DB with apply/skip tracking
+- **Phase 2b/2c** — Analytics + RAG chat (not yet built)
 
 ---
 
@@ -55,7 +60,7 @@ SLEEP_BETWEEN_BATCHES    = 2
 
 # Parallel processing
 CLAUDE_MAX_CONCURRENCY   = 8       # Semaphore cap for concurrent Claude calls
-MAX_DB_CONNS             = 10      # ThreadedConnectionPool maxconn
+MAX_DB_CONNS             = 20      # ThreadedConnectionPool maxconn (shared by API + pipeline)
 CLAUDE_MAX_RETRIES       = 6
 CLAUDE_BACKOFF_BASE      = 1.0
 CLAUDE_BACKOFF_CAP       = 30.0
@@ -73,6 +78,16 @@ DUPLICATE_DETECTION_THRESHOLD = 0.15
 # Weaviate
 WEAVIATE_VECTORIZER      = "text2vec-weaviate"
 CLASSIFICATION_BATCH_LIMIT = 100
+
+# AI Review
+AI_REVIEW_BATCH_SIZE            = 10    # topics/subtopics per Claude call
+AI_REVIEW_SUBTOPIC_LIMIT        = 50    # max subtopics selectable per topic in UI
+AI_REVIEW_TOPIC_REQUEST_LIMIT   = 200   # max topics per ai-review request
+AI_REVIEW_SUBTOPIC_REQUEST_LIMIT= 200   # max subtopics per ai-review request
+AI_REVIEW_PARALLEL_BATCHES      = 3     # max concurrent Claude batch calls
+AI_REVIEW_WEAVIATE_NEIGHBORS    = 5     # neighbours per similarity search
+AI_REVIEW_TOPICS_REF_LIMIT      = 200   # max topics in reference list (ordered by subtopic count desc)
+AI_REVIEW_SUBTOPICS_REF_LIMIT   = 500   # max subtopics in reference list (ordered by match_count desc)
 
 # RAG (Phase 2c — not yet built)
 RAG_CHAT_TEMPERATURE         = 0.3
@@ -131,8 +146,6 @@ Vite proxies `/api/*` to `http://localhost:8000`.
 │   │   ├── maintenance.py             # Phase 2: centroid update + duplicate detection
 │   │   ├── vectorize.py               # Weaviate bulk sync from Redshift
 │   │   └── reprocess.py               # Reprocess segment_descriptions via Claude
-│   └── lib/
-│       └── clustering.py              # cluster_by_proposal (legacy, kept for fallback)
 ├── backend/
 │   ├── requirements.txt
 │   └── app/
@@ -146,6 +159,7 @@ Vite proxies `/api/*` to `http://localhost:8000`.
 │           ├── classification_logs.py # classification audit log
 │           ├── candidates.py          # review queue (approve/reject/merge)
 │           ├── taxonomy.py            # tree, topics, subtopics, uncategorized
+│           ├── taxonomy_ai.py         # AI review sessions + suggestions
 │           ├── review.py              # topic/subtopic merge, move, delete, issue reassignment
 │           ├── maintenance.py         # centroids, duplicates
 │           └── weaviate.py            # setup, migrate, sync, status
@@ -157,19 +171,19 @@ Vite proxies `/api/*` to `http://localhost:8000`.
 │       │   ├── Dashboard.jsx
 │       │   ├── Pipeline.jsx           # Extraction with live SSE log
 │       │   ├── Transcripts.jsx
-│       │   ├── Issues.jsx             # With bulk reprocess
+│       │   ├── Issues.jsx             # With bulk reprocess + issue ID filter
 │       │   ├── Logs.jsx               # Extraction audit log
 │       │   ├── ClassificationLogs.jsx # Classification audit log
 │       │   ├── taxonomy/
 │       │   │   ├── ProcessTopics.jsx  # Classify + review queue
-│       │   │   ├── ReviewTopics.jsx   # Edit, merge, move, delete topics & subtopics
+│       │   │   ├── ReviewTopics.jsx   # Governance: health, bulk ops, AI review
 │       │   │   └── ViewTopics.jsx     # Browse taxonomy tree (read-only)
-│       │   └── weaviate/
-│       │       ├── Setup.jsx          # Collections status + migrate
-│       │       ├── SyncIssues.jsx
-│       │       └── SyncTranscripts.jsx
+│       │   └── config/
+│       │       ├── WeaviateSetup.jsx  # Collections status, migrate, sync issues/transcripts
+│       │       └── Prompts.jsx        # View and edit all Claude prompts
 │       └── components/
 │           ├── ClassificationBadge.jsx
+│           ├── StatTile.jsx               # Shared stat tile used by Logs, ClassificationLogs, WeaviateSetup
 │           ├── MergeModal.jsx             # Topic/subtopic merge dialog
 │           ├── ReassignModal.jsx          # Issue/subtopic reassignment dialog
 │           └── ui/                    # button, card, input, select, skeleton, table, sheet
@@ -194,9 +208,11 @@ Vite proxies `/api/*` to `http://localhost:8000`.
 
 **`topics`** — taxonomy level 1
 - id, product_area_id (FK, nullable), name, description, is_active, created_at
+- **`merged_into_id`** (INT, nullable) — set when soft-deleted via merge; preserves lineage
 
 **`sub_topics`** — taxonomy level 2
 - id, topic_id (FK), name, canonical_description, match_count, is_active, created_at
+- **`merged_into_id`** (INT, nullable) — set when soft-deleted via merge; preserves lineage
 
 **`classified_issues`** — one row per extracted issue
 - id, transcript_id (FK), extraction_log_id (FK, nullable), sub_topic_id (FK, nullable), nature_id (FK), intent_id (FK)
@@ -212,17 +228,31 @@ Vite proxies `/api/*` to `http://localhost:8000`.
 ### Audit / log tables
 **`extraction_logs`** — one row per transcript extraction
 - id, transcript_id (FK), model, prompt_system, prompt_user, response_raw
-- issues_created, status, error_message, input_tokens, output_tokens, cost_usd, executed_at
+- issues_created, status, error_message, input_tokens, output_tokens, cost_usd
+- **`triggered_by`** VARCHAR(50) DEFAULT `'ui'` — `'ui'` or `'dagster'` (Phase 3 Dagster integration)
+- executed_at
 
 **`classification_logs`** — one row per issue classification decision
-- id, issue_id (FK), band (A/B/C/manual), decision
+- id, issue_id (FK), band (A/B/C/manual — VARCHAR(10)), decision
 - matched_subtopic_id, matched_subtopic_name, confidence_score
 - weaviate_candidates (JSON), prompt_used, claude_response
-- model_used, input_tokens, output_tokens, cost_usd, auto_create, error_message, classified_at
+- model_used, input_tokens, output_tokens, cost_usd, auto_create, error_message
+- **`triggered_by`** VARCHAR(50) DEFAULT `'ui'` — `'ui'` or `'dagster'`
+- classified_at
 
 **`issue_reprocess_logs`** — one row per segment_description reprocess
 - id, issue_id (FK), model, old_segment_description, new_segment_description
 - verbatim_excerpt, input_tokens, output_tokens, cost_usd, reprocessed_at
+
+**`taxonomy_changes`** — structural taxonomy operations audit trail
+- id, action_type (merge_topic/merge_subtopic/move_subtopic/rename_topic/rename_subtopic/deactivate_topic/deactivate_subtopic)
+- entity_type (topic/subtopic), source_id, source_name, target_id, target_name, notes, performed_at
+
+**`ai_review_sessions`** — one row per "Review with AI" run
+- id, topic_ids (comma-separated), model, input_tokens, output_tokens, cost_usd, batches, created_at
+
+**`ai_review_suggestions`** — one row per suggestion returned by Claude
+- id, session_id (FK), suggestion_idx, suggestion_type, title, payload (full JSON), status (pending/applied/skipped), applied_at, skipped_at
 
 ---
 
@@ -370,6 +400,29 @@ SubTopic is populated dynamically as candidates are created and approved — no 
 - **Model:** `MODEL_CENTROID_UPDATE`, temperature 0.2, max_tokens 512
 - **Input:** subtopic name + current description + matched issue descriptions
 - **Output:** `{canonical_description, changes_summary}`
+- **Automatic trigger:** runs via `_run_centroid_for_subtopic()` after every `merge_subtopic` and `merge_topic` operation (unless `run_centroid=False`). Requires ≥ 3 matched issues to run.
+
+### Prompt 5 — Segment description reprocess (`shared/prompts/reprocess.py`)
+- **Model:** `MODEL_EXTRACTION`, temperature 0, max_tokens 512
+- **Input:** verbatim_excerpt (raw customer quotes)
+- **Output:** `{segment_description}`
+
+### Prompt 6 — Taxonomy AI Review (`shared/prompts/taxonomy_review.py`)
+- **Model:** `MODEL_NEW_SUBTOPIC` (claude-opus-4-7), no temperature, max_tokens 16000
+- **Two independent review modes in a single prompt:**
+  - **Topic-level** (`topic_ids`): topics evaluated as units against all other topics → only `merge_topics`, `rename_topic`
+  - **Subtopic-level** (`subtopic_ids`): subtopics evaluated in full detail → only `merge_subtopics`, `move_subtopic`, `rename_subtopic`
+- **Input:** `topics_for_unit_review` (name + product area + subtopic name list) + `subtopics_for_detail_review` (canonical description + examples + Weaviate similarity pairs < 0.25) + `all_topics_reference` (top 200 by subtopic count) + `all_subtopics_reference` (top 500 by match_count, both with PA context)
+- **`restrict_to_pa`:** when true, reference lists are filtered to the product area(s) of the selected items — prevents cross-PA merge suggestions
+- **No-change is valid:** prompt explicitly states changes are not mandatory; items left unchanged go to `looks_good` with rationale
+- **Output:** `{suggestions: [{type, title, rationale, ...ids, proposed_name, proposed_description}], looks_good: [{type, topic_id/subtopic_id, name, rationale}]}`
+- **Suggestion details enriched with PA context:** `merge_topics` includes `topic_product_areas`; `merge_subtopics` includes `subtopic_contexts`; all types show `PA > Topic > Subtopic` paths in the UI
+- **Auto-batching:** `AI_REVIEW_BATCH_SIZE=10` items per list per batch, `AI_REVIEW_PARALLEL_BATCHES=3` concurrent Claude calls; results aggregated across batches
+- **Sessions:** results saved to `ai_review_sessions` + `ai_review_suggestions`; apply/skip tracked per suggestion
+- **Bulk apply:** conflict detection (merge+move on same entity, survivor=source, move-dest-merged, rename-deleted) → resolution UI → grouped parallel execution (renames → moves → merges) → centroid run for applied merges only (targeted by `suggestion_indices`)
+
+### Prompt override system (`shared/prompts/store.py`)
+All 6 prompts are defined as defaults in `store.py`. Overrides are saved to `shared/prompts/overrides.json` (gitignored). At runtime, `get_system()` and `get_user_template()` check for overrides first. The Configuration → Prompts UI page lets users edit any prompt and save/reset overrides.
 
 ---
 
@@ -381,21 +434,21 @@ Dashboard
 Pipeline
   Pipeline           # Extraction with live SSE log, filters, stop button
   Transcripts        # Browse with expand to see raw_text + issues
-  Issues             # Browse with bulk reprocess + reprocess history
+  Issues             # Browse with bulk reprocess + reprocess history; filter by Issue ID
 ──────────────────
 Taxonomy
   Process Topics     # Run classification + review queue (approve/merge/reject)
-  Review Topics      # Edit, merge, move, delete topics & subtopics
+  Review Topics      # Governance: health per PA, filters, bulk ops, AI review with conflict detection
   View Topics        # Browse product areas > topics > subtopics > issues (read-only)
 ──────────────────
-Weaviate
-  Setup              # Collection status + initialize + migrate schema
-  Sync Issues        # Sync ClassifiedIssue collection
-  Sync Transcripts   # Sync Transcript collection
-──────────────────
 Audit Logs
-  Extraction Log     # extraction_logs with filters, tokens, cost, prompt/response
-  Classification Log # classification_logs with band filter, Weaviate candidates view
+  Extraction Log     # extraction_logs with filters (incl. triggered_by), tokens, cost, prompt/response
+  Classification Log # classification_logs with band/decision/source/issue ID filters
+  Taxonomy Log       # taxonomy_changes — merge/move/rename/deactivate history
+──────────────────
+Configuration
+  Weaviate Setup     # Collections status, initialize, migrate schema, sync issues/transcripts
+  Prompts            # View and edit all Claude prompts with model info; overrides saved to overrides.json
 ```
 
 ### Key UI conventions
@@ -407,7 +460,7 @@ Audit Logs
 
 ---
 
-## Review Topics — Taxonomy Governance (Phase 2a, not yet built)
+## Review Topics — Taxonomy Governance (built)
 
 The Review Topics page is purpose-built for cleaning up auto-created topics: editing names, merging duplicates, reorganizing subtopics, and reassigning issues. Lives at `frontend/src/pages/taxonomy/ReviewTopics.jsx`.
 
@@ -460,11 +513,17 @@ Left panel shows the full topic list. Right panel shows the detail/action area f
   - Each issue has a **reassign** button (↗ icon) — opens `ReassignModal.jsx` to pick a different subtopic
   - Checkbox selection for bulk reassignment — select multiple issues, then "Move selected to..." dropdown
 
-**Bulk operations toolbar** (appears when checkboxes are selected):
-- For topics: "Merge N selected topics into..." → dropdown to pick the surviving topic
-- For issues: "Move N selected issues to..." → dropdown to pick target subtopic
+**Bulk operations toolbar** (sticky, appears when checkboxes are selected):
+- Contextual actions based on selection type:
+  - **Topics only:** Merge into…, Delete N, Review with AI
+  - **Subtopics only:** Merge into…, Move to topic…, Delete N, Review with AI
+  - **Mixed:** Delete N, Review with AI
+- **"Within Product Area only"** option on Review with AI — when all selected items belong to one PA, shows confirmation dialog before firing; restricts Claude's reference lists to that PA only
+- **Select dropdown** on the select-all checkbox: "Select all topics", "Select all subtopics", "Select all (topics + subtopics)" — all capped at `AI_REVIEW_TOPIC_REQUEST_LIMIT` / `AI_REVIEW_SUBTOPIC_REQUEST_LIMIT`
+- **Health metric filter toggles** below the health table: 0 subtopics, 1 subtopic, 1 issue, Few issues, No issues
+- **Screen lock during AI review and bulk operations:** health banner, filter toggles, and topic checkboxes are disabled while a review is processing or bulk action is running
 
-### Review Topics endpoints (not yet built)
+### Review Topics endpoints
 
 ```
 # Topic management
@@ -497,40 +556,51 @@ GET  /api/taxonomy/health               # Taxonomy quality indicators
   }
 ```
 
-**Note:** `PUT /api/taxonomy/subtopics/{id}` already exists for editing name/description. The new endpoints above cover merge, move, delete, and reassignment operations.
-
 ### What merge/move/reassign operations do under the hood
 
+**All operations use soft-delete — no hard DELETE.** Source records are deactivated with `is_active = FALSE` and `merged_into_id = <target>` so lineage is preserved and operations are reversible. Every action writes to `taxonomy.taxonomy_changes`.
+
 **Merge topic A into topic B:**
-1. `UPDATE taxonomy.sub_topics SET topic_id = B WHERE topic_id = A`
-2. Update all affected subtopics in Weaviate `SubTopic` collection (new `topic_id`, new `product_area_id` from topic B)
-3. Update all affected issues in Weaviate `ClassifiedIssue` collection (new `topic_id`, new `product_area_id`)
-4. `DELETE FROM taxonomy.topics WHERE id = A`
-5. Log as `classification_logs` with `band='manual'`, `decision='topic_merged'`
+1. Move all subtopics: `UPDATE taxonomy.sub_topics SET topic_id = B WHERE topic_id = A`
+2. Update Weaviate SubTopic + ClassifiedIssue for all moved subtopics
+3. Soft-delete: `UPDATE taxonomy.topics SET is_active = FALSE, merged_into_id = B WHERE id = A`
+4. Write to `taxonomy_changes`: `action_type='merge_topic'`
+5. Optionally run centroid update on each surviving subtopic (`run_centroid=True` by default)
 
 **Move subtopic from topic A to topic B:**
 1. `UPDATE taxonomy.sub_topics SET topic_id = B WHERE id = subtopic_id`
-2. Get `product_area_id` from topic B
-3. Update subtopic in Weaviate `SubTopic` collection (new `topic_id`, `product_area_id`)
-4. Update all linked issues in Weaviate `ClassifiedIssue` collection (new `topic_id`, `product_area_id`)
-5. Log as `band='manual'`, `decision='subtopic_moved'`
+2. Update Weaviate SubTopic + ClassifiedIssue with new topic_id/product_area_id
+3. Write to `taxonomy_changes`: `action_type='move_subtopic'`
 
 **Merge subtopic A into subtopic B:**
-1. `UPDATE taxonomy.classified_issues SET sub_topic_id = B WHERE sub_topic_id = A`
-2. `UPDATE taxonomy.sub_topics SET match_count = (SELECT COUNT(*) FROM classified_issues WHERE sub_topic_id = B) WHERE id = B`
-3. Update all affected issues in Weaviate `ClassifiedIssue` collection (new `sub_topic_id`)
-4. Delete subtopic A from Weaviate `SubTopic` collection
-5. `DELETE FROM taxonomy.sub_topics WHERE id = A`
-6. Optionally: ask Claude to regenerate subtopic B's `canonical_description` to cover the merged scope
-7. Log as `band='manual'`, `decision='subtopic_merged'`
+1. Reassign all issues from A to B
+2. Update Weaviate ClassifiedIssue for each issue
+3. Soft-delete A: `UPDATE taxonomy.sub_topics SET is_active = FALSE, merged_into_id = B WHERE id = A`
+4. Delete A from Weaviate SubTopic
+5. Write to `taxonomy_changes`: `action_type='merge_subtopic'`
+6. **Automatically** run centroid update on B (Prompt 4) unless `run_centroid=False`
 
 **Reassign issue from subtopic A to subtopic B:**
-1. `UPDATE taxonomy.classified_issues SET sub_topic_id = B WHERE id = issue_id`
-2. Decrement `match_count` on subtopic A, increment on subtopic B
-3. Update the issue in Weaviate `ClassifiedIssue` collection (new `sub_topic_id`, `topic_id`, `product_area_id`)
-4. Log as `band='manual'`, `decision='issue_reassigned'`
+1. Update classified_issue + Weaviate ClassifiedIssue
+2. Adjust match_counts on A and B
+3. Write to `classification_logs` with `band='manual'`, `decision='issue_reassigned'`
 
-**Bulk reassign** follows the same logic in a loop, wrapped in a transaction.
+### AI Review sessions
+
+`POST /api/taxonomy/ai-review` body: `{topic_ids: [...], subtopic_ids: [...], restrict_to_pa: bool}` — topic_ids or subtopic_ids or both.
+- `topic_ids` → topic-unit review (merge/rename topic suggestions only)
+- `subtopic_ids` → subtopic detail review (merge/move/rename subtopic suggestions only)
+- `restrict_to_pa` → when true, reference lists filtered to the PA(s) of selected items
+
+Results persisted to `ai_review_sessions` + `ai_review_suggestions`. Endpoints:
+- `POST /api/taxonomy/ai-reviews/{id}/suggestions/{idx}/apply?run_centroid=bool`
+- `POST /api/taxonomy/ai-reviews/{id}/suggestions/{idx}/skip`
+- `POST /api/taxonomy/ai-reviews/{id}/dismiss` — skips all pending
+- `POST /api/taxonomy/ai-reviews/{id}/run-centroids` body: `{suggestion_indices: [...]}` — runs centroid for specific applied merges only (avoids re-running previous session merges)
+
+**Bulk apply flow:** conflict detection → resolution UI → grouped parallel execution (renames → moves → merges) → single targeted centroid run for this run's merges only.
+
+The Review Topics page checks for incomplete sessions on load and shows a warning banner if any exist.
 
 ---
 

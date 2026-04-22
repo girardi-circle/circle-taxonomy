@@ -1,16 +1,17 @@
 import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
-import { LayoutDashboard, GitBranch, FileText, Tag, ScrollText, Network, Eye, Settings2, ListFilter, FileStack } from 'lucide-react'
+import { LayoutDashboard, GitBranch, FileText, Tag, ScrollText, Network, Eye, ListFilter, PenLine, MessageSquare, Database } from 'lucide-react'
 import Dashboard from './pages/Dashboard'
 import Pipeline from './pages/Pipeline'
 import Transcripts from './pages/Transcripts'
 import Issues from './pages/Issues'
 import Logs from './pages/Logs'
 import ClassificationLogs from './pages/ClassificationLogs'
+import TaxonomyLog from './pages/taxonomy/TaxonomyLog'
 import ProcessTopics from './pages/taxonomy/ProcessTopics'
+import ReviewTopics from './pages/taxonomy/ReviewTopics'
 import ViewTopics from './pages/taxonomy/ViewTopics'
-import WeaviateSetup from './pages/weaviate/Setup'
-import SyncIssues from './pages/weaviate/SyncIssues'
-import SyncTranscripts from './pages/weaviate/SyncTranscripts'
+import WeaviateSetup from './pages/config/WeaviateSetup'
+import Prompts from './pages/config/Prompts'
 
 const PHASE1_NAV = [
   { path: '/', label: 'Dashboard', icon: LayoutDashboard },
@@ -25,17 +26,18 @@ const PIPELINE_NAV = [
 const AUDIT_NAV = [
   { path: '/logs', label: 'Extraction Log', icon: ScrollText },
   { path: '/classification-logs', label: 'Classification Log', icon: ListFilter },
+  { path: '/taxonomy-log', label: 'Taxonomy Log', icon: FileText },
 ]
 
 const TAXONOMY_NAV = [
   { path: '/taxonomy/process', label: 'Process Topics', icon: Network },
+  { path: '/taxonomy/review', label: 'Review Topics', icon: PenLine },
   { path: '/taxonomy/view', label: 'View Topics', icon: Eye },
 ]
 
-const WEAVIATE_NAV = [
-  { path: '/weaviate/setup', label: 'Setup', icon: Settings2 },
-  { path: '/weaviate/issues', label: 'Sync Issues', icon: Tag },
-  { path: '/weaviate/transcripts', label: 'Sync Transcripts', icon: FileStack },
+const CONFIG_NAV = [
+  { path: '/config/weaviate', label: 'Weaviate Setup', icon: Database },
+  { path: '/config/prompts', label: 'Prompts', icon: MessageSquare },
 ]
 
 function NavItem({ path, label, icon: Icon, indent = false }) {
@@ -83,11 +85,11 @@ export default function App() {
             <SectionLabel label="Taxonomy" />
             {TAXONOMY_NAV.map(item => <NavItem key={item.path} {...item} indent />)}
 
-            <SectionLabel label="Weaviate" />
-            {WEAVIATE_NAV.map(item => <NavItem key={item.path} {...item} indent />)}
-
             <SectionLabel label="Audit Logs" />
             {AUDIT_NAV.map(item => <NavItem key={item.path} {...item} indent />)}
+
+            <SectionLabel label="Configuration" />
+            {CONFIG_NAV.map(item => <NavItem key={item.path} {...item} indent />)}
           </nav>
         </aside>
 
@@ -99,11 +101,12 @@ export default function App() {
             <Route path="/issues" element={<Issues />} />
             <Route path="/logs" element={<Logs />} />
             <Route path="/classification-logs" element={<ClassificationLogs />} />
+            <Route path="/taxonomy-log" element={<TaxonomyLog />} />
             <Route path="/taxonomy/process" element={<ProcessTopics />} />
+            <Route path="/taxonomy/review" element={<ReviewTopics />} />
             <Route path="/taxonomy/view" element={<ViewTopics />} />
-            <Route path="/weaviate/setup" element={<WeaviateSetup />} />
-            <Route path="/weaviate/issues" element={<SyncIssues />} />
-            <Route path="/weaviate/transcripts" element={<SyncTranscripts />} />
+            <Route path="/config/weaviate" element={<WeaviateSetup />} />
+            <Route path="/config/prompts" element={<Prompts />} />
           </Routes>
         </main>
       </div>

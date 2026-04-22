@@ -16,7 +16,6 @@ from shared.services.redshift import fetch_all, fetch_one, execute
 from shared.services import weaviate as weaviate_service
 from shared.prompts.validation import build_arbitration_prompt
 from shared.prompts.new_subtopic import build_new_subtopic_prompt
-from shared.lib.clustering import cluster_by_proposal
 from shared.pipeline.extraction import _emit, _strip_fences
 
 logger = logging.getLogger(__name__)
@@ -121,22 +120,30 @@ def _link_issue_to_candidate(issue_id: int, candidate_id: int) -> None:
     logger.info("Linked issue %s to existing candidate %s (cluster_size=%d)", issue_id, candidate_id, len(existing_list))
 
 
-def _create_single_candidate(issue: dict, proposal: dict) -> int | None:
+def _create_single_candidate(
+    issue: dict,
+    proposal: dict,
+    product_areas: Optional[dict] = None,
+) -> int | None:
     """Create an emerging_candidate immediately (not batched) and insert into Weaviate as pending.
-    Returns the new candidate_id so subsequent issues in the same batch can find it."""
-    topic_name = proposal.get("topic_name") or proposal.get("topic_name") or "Unknown"
+    Returns the new candidate_id so subsequent issues in the same batch can find it.
+    product_areas: pre-loaded {lowercase_name: id} dict — falls back to DB query if None."""
+    topic_name = proposal.get("topic_name") or proposal.get("existing_topic") or "Unknown"
     subtopic_name = proposal.get("suggested_subtopic_name") or "Uncategorized"
     canonical_description = proposal.get("canonical_description") or ""
     product_area_name = proposal.get("product_area") or ""
 
     product_area_id = None
     if product_area_name:
-        pa_row = fetch_one(
-            "SELECT id FROM taxonomy.product_areas WHERE LOWER(name) = LOWER(%s)",
-            (product_area_name,),
-        )
-        if pa_row:
-            product_area_id = pa_row["id"]
+        if product_areas is not None:
+            product_area_id = product_areas.get(product_area_name.lower())
+        else:
+            pa_row = fetch_one(
+                "SELECT id FROM taxonomy.product_areas WHERE LOWER(name) = LOWER(%s)",
+                (product_area_name,),
+            )
+            if pa_row:
+                product_area_id = pa_row["id"]
 
     execute(
         """INSERT INTO taxonomy.emerging_candidates
@@ -192,18 +199,33 @@ def _load_topics() -> list[dict]:
 
 
 def _get_subtopic_context(subtopic_id: int) -> Optional[dict]:
-    """Get topic_id and product_area_id for a subtopic."""
+    """Get topic_id and product_area_id for a single subtopic (fallback for cache misses)."""
     return fetch_one(
-        """
-        SELECT
-            st.topic_id,
-            t.product_area_id
-        FROM taxonomy.sub_topics st
-        JOIN taxonomy.topics t ON st.topic_id = t.id
-        WHERE st.id = %s
-        """,
+        """SELECT st.topic_id, t.product_area_id
+           FROM taxonomy.sub_topics st
+           JOIN taxonomy.topics t ON st.topic_id = t.id
+           WHERE st.id = %s""",
         (subtopic_id,),
     )
+
+
+def _load_subtopic_context_cache() -> dict[int, dict]:
+    """Pre-load topic_id + product_area_id for ALL active subtopics in one query.
+    Replaces per-issue _get_subtopic_context calls in the classification loop."""
+    rows = fetch_all(
+        """SELECT st.id AS subtopic_id, st.topic_id, t.product_area_id
+           FROM taxonomy.sub_topics st
+           JOIN taxonomy.topics t ON st.topic_id = t.id
+           WHERE st.is_active = TRUE"""
+    )
+    return {row["subtopic_id"]: {"topic_id": row["topic_id"], "product_area_id": row["product_area_id"]} for row in rows}
+
+
+def _load_product_areas() -> dict[str, int]:
+    """Pre-load all product areas keyed by lowercase name.
+    Replaces per-candidate product area lookups in Band C."""
+    rows = fetch_all("SELECT id, name FROM taxonomy.product_areas")
+    return {row["name"].lower(): row["id"] for row in rows}
 
 
 def _assign_subtopic(
@@ -211,14 +233,16 @@ def _assign_subtopic(
     subtopic_id: int,
     confidence_score: float,
     match_method: str,
+    subtopic_ctx: Optional[dict] = None,
 ) -> None:
     """
     Mark an issue as matched:
     - UPDATE classified_issues (status=matched, sub_topic_id, confidence_score, match_method)
     - UPDATE sub_topics match_count+1
     - Sync to Weaviate
+    subtopic_ctx: pre-loaded {topic_id, product_area_id} — falls back to DB query if None.
     """
-    context = _get_subtopic_context(subtopic_id)
+    context = subtopic_ctx or _get_subtopic_context(subtopic_id)
     topic_id = context["topic_id"] if context else 0
     product_area_id = context["product_area_id"] if context else None
 
@@ -303,15 +327,23 @@ def _call_new_subtopic(
         result = json.loads(_strip_fences(text))
         return result, system, user, text, usage
     except Exception as e:
+        # Re-raise so the pipeline marks this issue as an error rather than
+        # silently grouping it under a meaningless "Unknown" topic.
         logger.warning("New subtopic call failed for issue %s: %s", issue["id"], e)
-        fallback = {
-            "existing_topic": False, "topic_id": None, "topic_name": "Unknown",
-            "topic_description": "", "product_area": "",
-            "suggested_subtopic_name": "Uncategorized",
-            "canonical_description": issue.get("segment_description", ""),
-            "rationale": f"proposal_error: {e}",
-        }
-        return fallback, system, user, "", {}
+        raise
+
+    # Validate that Claude returned a meaningful topic name — never accept generic placeholders
+    if not result:
+        raise ValueError(f"Empty proposal from Claude for issue {issue['id']}")
+    fallback_names = {"unknown", "general", "miscellaneous", "other", "uncategorized", "n/a", "none"}
+    topic_name = (result.get("topic_name") or "").strip()
+    if topic_name.lower() in fallback_names:
+        raise ValueError(
+            f"Claude returned a generic topic name '{topic_name}' for issue {issue['id']}. "
+            "This is not allowed — the issue will be skipped."
+        )
+
+    return result, system, user, text, usage
 
 
 def _write_classification_log(
@@ -353,8 +385,10 @@ def _get_or_create_topic(
     topic_name: str,
     topic_description: str,
     product_area_name: str,
+    product_areas: Optional[dict] = None,
 ) -> int:
-    """Get existing topic by name or create a new one. Returns topic_id."""
+    """Get existing topic by name or create a new one. Returns topic_id.
+    product_areas: pre-loaded {lowercase_name: id} dict — falls back to DB query if None."""
     existing = fetch_one(
         "SELECT id FROM taxonomy.topics WHERE LOWER(name) = LOWER(%s)",
         (topic_name,),
@@ -365,12 +399,15 @@ def _get_or_create_topic(
     # Resolve product_area_id
     product_area_id = None
     if product_area_name:
-        pa_row = fetch_one(
-            "SELECT id FROM taxonomy.product_areas WHERE LOWER(name) = LOWER(%s)",
-            (product_area_name,),
-        )
-        if pa_row:
-            product_area_id = pa_row["id"]
+        if product_areas is not None:
+            product_area_id = product_areas.get(product_area_name.lower())
+        else:
+            pa_row = fetch_one(
+                "SELECT id FROM taxonomy.product_areas WHERE LOWER(name) = LOWER(%s)",
+                (product_area_name,),
+            )
+            if pa_row:
+                product_area_id = pa_row["id"]
 
     execute(
         "INSERT INTO taxonomy.topics (name, description, product_area_id) VALUES (%s, %s, %s)",
@@ -388,16 +425,17 @@ def _get_or_create_topic(
 def _create_topic_subtopic(
     proposal: dict,
     topics: list[dict],
-) -> tuple[int, int, bool]:
+    product_areas: Optional[dict] = None,
+) -> tuple[int, int, Optional[int], bool]:
     """
     Creates topic (if new) and subtopic in Redshift and Weaviate.
-    Returns (topic_id, subtopic_id, is_new_topic).
+    Returns (topic_id, subtopic_id, product_area_id, is_new_topic).
+    product_areas: pre-loaded {lowercase_name: id} dict — falls back to DB query if None.
     """
     is_new_topic = False
 
     if proposal.get("existing_topic") and proposal.get("topic_id"):
         topic_id = proposal["topic_id"]
-        # Find product_area_id from existing topics list
         topic_row = next((t for t in topics if t["id"] == topic_id), None)
         product_area_id = topic_row["product_area_id"] if topic_row else None
         product_area_name = topic_row.get("product_area_name", "") if topic_row else ""
@@ -406,17 +444,20 @@ def _create_topic_subtopic(
         topic_name = proposal.get("topic_name") or "Unknown"
         topic_description = proposal.get("topic_description") or ""
         product_area_name = proposal.get("product_area") or ""
-        topic_id = _get_or_create_topic(topic_name, topic_description, product_area_name)
+        topic_id = _get_or_create_topic(topic_name, topic_description, product_area_name, product_areas)
 
-        # Resolve product_area_id
+        # Resolve product_area_id from pre-loaded dict or DB fallback
         product_area_id = None
         if product_area_name:
-            pa_row = fetch_one(
-                "SELECT id FROM taxonomy.product_areas WHERE LOWER(name) = LOWER(%s)",
-                (product_area_name,),
-            )
-            if pa_row:
-                product_area_id = pa_row["id"]
+            if product_areas is not None:
+                product_area_id = product_areas.get(product_area_name.lower())
+            else:
+                pa_row = fetch_one(
+                    "SELECT id FROM taxonomy.product_areas WHERE LOWER(name) = LOWER(%s)",
+                    (product_area_name,),
+                )
+                if pa_row:
+                    product_area_id = pa_row["id"]
 
     subtopic_name = proposal.get("suggested_subtopic_name") or "Uncategorized"
     canonical_description = proposal.get("canonical_description") or ""
@@ -443,7 +484,7 @@ def _create_topic_subtopic(
     except Exception as e:
         logger.warning("Weaviate upsert for new subtopic %s failed: %s", subtopic_id, e)
 
-    return topic_id, subtopic_id, is_new_topic
+    return topic_id, subtopic_id, product_area_id, is_new_topic
 
 
 def _create_emerging_candidates(clusters: list[dict]) -> int:
@@ -526,6 +567,9 @@ def stream_classification(
         return
 
     topics = _load_topics()
+    # Pre-load lookup caches — eliminates N+1 queries during per-issue processing
+    subtopic_ctx_cache: dict[int, dict] = _load_subtopic_context_cache()
+    product_areas: dict[str, int] = _load_product_areas()
 
     matched = 0
     created = 0
@@ -581,7 +625,8 @@ def stream_classification(
                         })
                     else:
                         # Band A — auto-assign to approved subtopic
-                        _assign_subtopic(issue["id"], top["subtopic_id"], confidence, "vector_direct")
+                        _assign_subtopic(issue["id"], top["subtopic_id"], confidence, "vector_direct",
+                                         subtopic_ctx=subtopic_ctx_cache.get(top["subtopic_id"]))
                         matched += 1
                         assigned = True
                         _write_classification_log(
@@ -639,7 +684,8 @@ def stream_classification(
                             sub_id = arbitration.get("subtopic_id")
                             if sub_id:
                                 subtopic_name = next((c["name"] for c in candidates if c.get("subtopic_id") == sub_id), None)
-                                _assign_subtopic(issue["id"], sub_id, confidence, "llm_confirmed")
+                                _assign_subtopic(issue["id"], sub_id, confidence, "llm_confirmed",
+                                                 subtopic_ctx=subtopic_ctx_cache.get(sub_id))
                                 matched += 1
                                 assigned = True
                                 _write_classification_log(
@@ -679,8 +725,11 @@ def stream_classification(
                 ns_cost = config.compute_cost(config.MODEL_NEW_SUBTOPIC, ns_usage.get("input_tokens", 0), ns_usage.get("output_tokens", 0))
 
                 if auto_create:
-                    _topic_id, subtopic_id, _is_new = _create_topic_subtopic(proposal, topics)
-                    _assign_subtopic(issue["id"], subtopic_id, 0.0, "new_subtopic")
+                    _topic_id, subtopic_id, _new_pa_id, _is_new = _create_topic_subtopic(proposal, topics, product_areas)
+                    # Add newly created subtopic to cache so the same run can use it
+                    subtopic_ctx_cache[subtopic_id] = {"topic_id": _topic_id, "product_area_id": _new_pa_id}
+                    _assign_subtopic(issue["id"], subtopic_id, 0.0, "new_subtopic",
+                                     subtopic_ctx=subtopic_ctx_cache[subtopic_id])
                     created += 1
                     topics = _load_topics()
                     _write_classification_log(
@@ -702,7 +751,7 @@ def stream_classification(
                 else:
                     # Create candidate immediately and insert into Weaviate as pending
                     # so the next issue in this batch can find it
-                    candidate_id = _create_single_candidate(issue, proposal)
+                    candidate_id = _create_single_candidate(issue, proposal, product_areas)
                     unmatched_count += 1
                     candidates_created += 1
                     _write_classification_log(

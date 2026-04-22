@@ -412,6 +412,24 @@ def update_candidate_to_approved(candidate_id: int, subtopic_id: int) -> bool:
         return False
 
 
+def update_subtopic_topic_assignment(subtopic_id: int, new_topic_id: int, new_product_area_id: Optional[int]) -> None:
+    """Update topic_id and product_area_id on a SubTopic entry (when moved or topic merged)."""
+    try:
+        client = get_client()
+        existing_uuid = _find_subtopic_uuid(client, subtopic_id)
+        if existing_uuid:
+            collection = client.collections.get(SUBTOPIC_COLLECTION)
+            collection.data.update(uuid=existing_uuid, properties={
+                "topic_id": new_topic_id or 0,
+                "product_area_id": new_product_area_id or 0,
+            })
+            logger.debug("Updated topic assignment for subtopic %s → topic %s", subtopic_id, new_topic_id)
+        else:
+            logger.debug("update_subtopic_topic_assignment: subtopic %s not in Weaviate", subtopic_id)
+    except Exception as e:
+        logger.warning("update_subtopic_topic_assignment failed for subtopic %s: %s", subtopic_id, e)
+
+
 def update_subtopic_description(subtopic_id: int, canonical_description: str) -> None:
     """Update only the canonical_description of a subtopic (for centroid maintenance)."""
     try:
@@ -711,4 +729,66 @@ def find_similar_subtopics(
         ]
     except Exception as e:
         logger.error("find_similar_subtopics failed: %s", e)
+        return []
+
+
+def fetch_subtopic_vectors(subtopic_ids: list[int]) -> dict:
+    """
+    Fetch stored vectors for a list of subtopic IDs in a single Weaviate query.
+    Returns {subtopic_id: vector} — avoids re-embedding when vectors are already stored.
+    """
+    if not subtopic_ids:
+        return {}
+    try:
+        client = get_client()
+        collection = client.collections.get(SUBTOPIC_COLLECTION)
+        results = collection.query.fetch_objects(
+            filters=wvcq.Filter.by_property("subtopic_id").contains_any(subtopic_ids),
+            include_vector=True,
+            return_properties=["subtopic_id"],
+        )
+        return {
+            obj.properties["subtopic_id"]: obj.vector["default"]
+            for obj in results.objects
+            if obj.vector and "default" in obj.vector
+        }
+    except Exception as e:
+        logger.error("fetch_subtopic_vectors failed: %s", e)
+        return {}
+
+
+def find_similar_subtopics_by_vector(
+    vector: list[float],
+    exclude_subtopic_id: Optional[int] = None,
+    limit: int = 3,
+) -> list[dict]:
+    """
+    Find similar subtopics using a pre-fetched vector (avoids re-embedding on each call).
+    Returns list of dicts with subtopic_id, name, canonical_description, distance.
+    """
+    try:
+        client = get_client()
+        collection = client.collections.get(SUBTOPIC_COLLECTION)
+
+        filters = None
+        if exclude_subtopic_id is not None:
+            filters = wvcq.Filter.by_property("subtopic_id").not_equal(exclude_subtopic_id)
+
+        results = collection.query.near_vector(
+            near_vector=vector,
+            limit=limit + 1,
+            filters=filters,
+            return_metadata=wvcq.MetadataQuery(distance=True),
+        )
+        return [
+            {
+                "subtopic_id": obj.properties.get("subtopic_id"),
+                "name": obj.properties.get("name"),
+                "canonical_description": obj.properties.get("canonical_description"),
+                "distance": obj.metadata.distance,
+            }
+            for obj in results.objects[:limit]
+        ]
+    except Exception as e:
+        logger.error("find_similar_subtopics_by_vector failed: %s", e)
         return []

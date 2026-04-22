@@ -1,9 +1,11 @@
 import { useEffect, useState, useCallback } from 'react'
 import { api } from '@/api/client'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import { Select } from '@/components/ui/select'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Input } from '@/components/ui/input'
+import { StatTile } from '@/components/StatTile'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { formatDate, truncate } from '@/lib/utils'
 import { ChevronDown, ChevronRight } from 'lucide-react'
@@ -39,17 +41,6 @@ function DecisionBadge({ value }) {
   )
 }
 
-function StatTile({ label, main, sub }) {
-  return (
-    <Card>
-      <CardContent className="px-5 py-4">
-        <div className="text-xs text-muted-foreground mb-1">{label}</div>
-        <div className="text-2xl font-bold tabular-nums">{main ?? <Skeleton className="h-7 w-16" />}</div>
-        {sub && <div className="text-xs text-muted-foreground mt-0.5">{sub}</div>}
-      </CardContent>
-    </Card>
-  )
-}
 
 function ExpandedLog({ id }) {
   const [data, setData] = useState(null)
@@ -136,6 +127,15 @@ function ExpandedLog({ id }) {
   )
 }
 
+function TriggeredByBadge({ value }) {
+  if (!value || value === 'ui') return (
+    <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium bg-gray-100 text-gray-600 border-gray-200">ui</span>
+  )
+  return (
+    <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium bg-indigo-100 text-indigo-700 border-indigo-200">{value}</span>
+  )
+}
+
 function fmt(n, d = 0) { return n == null ? '—' : Number(n).toLocaleString('en-US', { maximumFractionDigits: d }) }
 function fmtCost(n) { return n == null ? '—' : `$${Number(n).toFixed(4)}` }
 
@@ -147,18 +147,22 @@ export default function ClassificationLogs() {
   const [limit, setLimit] = useState(20)
   const [band, setBand] = useState('')
   const [decision, setDecision] = useState('')
+  const [triggeredBy, setTriggeredBy] = useState('')
+  const [issueId, setIssueId] = useState('')
   const [expanded, setExpanded] = useState(null)
   const [error, setError] = useState(null)
 
   const load = useCallback(() => {
     setError(null)
     const params = { page, limit }
+    if (issueId) params.issue_id = parseInt(issueId)
     if (band) params.band = band
     if (decision) params.decision = decision
+    if (triggeredBy) params.triggered_by = triggeredBy
     api.classificationLogs.list(params)
       .then(d => { setItems(d.items); setTotal(d.total); setStats(d.stats) })
       .catch(e => setError(e.message))
-  }, [page, limit, band, decision])
+  }, [page, limit, issueId, band, decision, triggeredBy])
 
   useEffect(() => { load() }, [load])
 
@@ -183,6 +187,14 @@ export default function ClassificationLogs() {
 
       {/* Filters */}
       <div className="flex items-center gap-3">
+        <Input
+          type="number"
+          placeholder="Issue ID"
+          value={issueId}
+          onChange={e => { setIssueId(e.target.value); setPage(1) }}
+          className="h-9 w-28 text-sm"
+          min={1}
+        />
         <Select value={band} onChange={e => { setBand(e.target.value); setPage(1) }} className="w-36">
           <option value="">All bands</option>
           <option value="A">Band A</option>
@@ -196,6 +208,11 @@ export default function ClassificationLogs() {
           <option value="unmatched">Unmatched</option>
           <option value="rejected_to_C">Rejected to C</option>
           <option value="error">Error</option>
+        </Select>
+        <Select value={triggeredBy} onChange={e => { setTriggeredBy(e.target.value); setPage(1) }} className="w-36">
+          <option value="">All sources</option>
+          <option value="ui">UI</option>
+          <option value="dagster">Dagster</option>
         </Select>
       </div>
 
@@ -213,6 +230,7 @@ export default function ClassificationLogs() {
                 <TableHead>Matched subtopic</TableHead>
                 <TableHead className="text-right">Confidence</TableHead>
                 <TableHead>Model</TableHead>
+                <TableHead>Source</TableHead>
                 <TableHead className="text-right">Cost</TableHead>
                 <TableHead>Date</TableHead>
               </TableRow>
@@ -220,7 +238,7 @@ export default function ClassificationLogs() {
             <TableBody>
               {!items
                 ? Array.from({ length: 8 }).map((_, i) => (
-                    <TableRow key={i}><TableCell colSpan={9}><Skeleton className="h-5 w-full" /></TableCell></TableRow>
+                    <TableRow key={i}><TableCell colSpan={10}><Skeleton className="h-5 w-full" /></TableCell></TableRow>
                   ))
                 : items.map(log => (
                     <>
@@ -241,13 +259,14 @@ export default function ClassificationLogs() {
                           {log.confidence_score != null ? `${Math.round(log.confidence_score * 100)}%` : '—'}
                         </TableCell>
                         <TableCell className="text-xs text-muted-foreground">{log.model_used || '—'}</TableCell>
+                        <TableCell><TriggeredByBadge value={log.triggered_by} /></TableCell>
                         <TableCell className="text-right tabular-nums text-xs">
                           {log.cost_usd != null ? `$${log.cost_usd.toFixed(4)}` : '—'}
                         </TableCell>
                         <TableCell className="text-xs text-muted-foreground whitespace-nowrap">{formatDate(log.classified_at)}</TableCell>
                       </TableRow>
                       {expanded === log.id && (
-                        <tr key={`${log.id}-exp`}><td colSpan={9} className="p-0"><ExpandedLog id={log.id} /></td></tr>
+                        <tr key={`${log.id}-exp`}><td colSpan={10} className="p-0"><ExpandedLog id={log.id} /></td></tr>
                       )}
                     </>
                   ))}

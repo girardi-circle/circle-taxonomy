@@ -145,17 +145,19 @@ def execute_with_retry(conn, query: str, params=None) -> bool:
     return False
 
 
-# ── Convenience helpers (used by API routes) ─────────────────────────────────
+# ── Convenience helpers ───────────────────────────────────────────────────────
+# All four functions use the shared pool so connections are reused across
+# requests rather than opened and closed on every call.
 
 def fetch_all(query: str, params=None) -> list[dict]:
-    with get_connection() as conn:
+    with get_pooled_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(query, params)
             return [dict(row) for row in cur.fetchall()]
 
 
 def fetch_one(query: str, params=None) -> dict | None:
-    with get_connection() as conn:
+    with get_pooled_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(query, params)
             row = cur.fetchone()
@@ -163,16 +165,30 @@ def fetch_one(query: str, params=None) -> dict | None:
 
 
 def execute(query: str, params=None) -> None:
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, params)
-        conn.commit()
+    with get_pooled_connection() as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
 
 
 def execute_returning_id(query: str, params=None) -> int | None:
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, params)
-            row = cur.fetchone()
-        conn.commit()
-        return row[0] if row else None
+    with get_pooled_connection() as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                row = cur.fetchone()
+            conn.commit()
+            return row[0] if row else None
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise

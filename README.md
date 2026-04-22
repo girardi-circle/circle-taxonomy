@@ -131,21 +131,24 @@ Before running classification, initialize Weaviate from the UI (**Weaviate → S
 
 ## Database schema
 
-The system uses 11 tables in the `taxonomy` schema:
+The system uses 14 tables in the `taxonomy` schema:
 
 | Table | Purpose |
 |-------|---------|
 | `product_areas` | 8 product teams (CMS, Live, Paywalls, …) |
 | `natures` | 7 issue types including Cancellation |
 | `intents` | 5 intent categories |
-| `topics` | Top-level topic categories |
-| `sub_topics` | Specific subtopics, vectorized in Weaviate |
+| `topics` | Top-level topic categories (soft-delete with `merged_into_id`) |
+| `sub_topics` | Specific subtopics, vectorized in Weaviate (soft-delete with `merged_into_id`) |
 | `transcripts` | Source records from Zendesk/Fathom |
 | `classified_issues` | One row per extracted issue |
 | `emerging_candidates` | Proposed subtopics pending review |
 | `extraction_logs` | Per-transcript extraction audit trail |
 | `classification_logs` | Per-issue classification decisions + manual actions |
 | `issue_reprocess_logs` | Segment description reprocess history |
+| `taxonomy_changes` | Structural taxonomy operations (merge/move/rename/deactivate) |
+| `ai_review_sessions` | Persisted AI review runs with cost + batch info |
+| `ai_review_suggestions` | Individual Claude suggestions with apply/skip status |
 
 See `docs/SCHEMA.md` for full definitions.
 

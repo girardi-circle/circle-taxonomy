@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { api } from '@/api/client'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
-import { NatureBadge, IntentBadge, SentimentBadge, StatusBadge } from '@/components/ClassificationBadge'
+import { NatureBadge, SentimentBadge } from '@/components/ClassificationBadge'
 import { formatDate, truncate } from '@/lib/utils'
 
 function StatCard({ title, value, sub }) {

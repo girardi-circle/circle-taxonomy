@@ -28,7 +28,7 @@ SLEEP_BETWEEN_BATCHES = 2     # seconds (legacy, not used in parallel mode)
 
 # === Parallel processing ===
 CLAUDE_MAX_CONCURRENCY = 8    # Semaphore cap: max in-flight Claude calls
-MAX_DB_CONNS = 10             # ThreadedConnectionPool maxconn (>= MAX_CONCURRENCY)
+MAX_DB_CONNS = 20             # ThreadedConnectionPool maxconn — shared by API routes + pipeline workers (>= MAX_CONCURRENCY)
 CLAUDE_MAX_RETRIES = 6        # retry attempts for Claude API errors
 CLAUDE_BACKOFF_BASE = 1.0     # initial backoff seconds
 CLAUDE_BACKOFF_CAP = 30.0     # max backoff seconds
@@ -40,7 +40,6 @@ PREFETCH = 50                 # rows pulled from DB per buffer refill
 # === Model pricing (USD per million tokens) — verify at console.anthropic.com/settings/billing ===
 MODEL_PRICING: dict[str, dict[str, float]] = {
     "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
-    "claude-opus-4-6-20250415": {"input": 15.00, "output": 75.00},
     "claude-opus-4-7":          {"input": 15.00, "output": 75.00},
 }
 
@@ -68,4 +67,14 @@ RAG_CHAT_MAX_TOKENS = 2048
 RAG_ISSUE_RETRIEVAL_LIMIT = 20
 RAG_TRANSCRIPT_RETRIEVAL_LIMIT = 10
 RAG_RELEVANCE_THRESHOLD = 0.40
-CLASSIFICATION_BATCH_LIMIT = 100
+CLASSIFICATION_BATCH_LIMIT = 100  # max issues fetched per classification run
+
+# === AI Review ===
+AI_REVIEW_BATCH_SIZE = 10        # topics/subtopics per Claude call; ~10 keeps prompts under 16k tokens
+AI_REVIEW_SUBTOPIC_LIMIT = 50    # max subtopics selectable per topic in UI; prevents oversized review sessions
+AI_REVIEW_TOPIC_REQUEST_LIMIT = 200    # max topics per ai-review request
+AI_REVIEW_SUBTOPIC_REQUEST_LIMIT = 200 # max subtopics per ai-review request
+AI_REVIEW_WEAVIATE_NEIGHBORS = 5 # neighbours returned per similarity search; top-5 covers the useful signal
+AI_REVIEW_PARALLEL_BATCHES = 3   # max concurrent Claude batch calls; capped to avoid rate limits on Opus
+AI_REVIEW_TOPICS_REF_LIMIT = 200     # max topics in reference list sent to Claude; ordered by subtopic count desc
+AI_REVIEW_SUBTOPICS_REF_LIMIT = 500  # max subtopics in reference list sent to Claude; ordered by match_count desc

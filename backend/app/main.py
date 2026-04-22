@@ -12,6 +12,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routes import pipeline, status, transcripts, issues, logs, candidates, taxonomy, maintenance
 from app.routes import weaviate as weaviate_routes
 from app.routes import classification_logs
+from app.routes import taxonomy_ai
+from app.routes import taxonomy_log
+from app.routes import config as config_routes
 
 logging.basicConfig(level=logging.INFO)
 
@@ -34,3 +37,6 @@ app.include_router(taxonomy.router, prefix="/api/taxonomy", tags=["taxonomy"])
 app.include_router(maintenance.router, prefix="/api/maintenance", tags=["maintenance"])
 app.include_router(weaviate_routes.router, prefix="/api/weaviate", tags=["weaviate"])
 app.include_router(classification_logs.router, prefix="/api/classification-logs", tags=["classification-logs"])
+app.include_router(taxonomy_ai.router, prefix="/api/taxonomy", tags=["taxonomy-ai"])
+app.include_router(taxonomy_log.router, prefix="/api/taxonomy-log", tags=["taxonomy-log"])
+app.include_router(config_routes.router, prefix="/api/config", tags=["config"])

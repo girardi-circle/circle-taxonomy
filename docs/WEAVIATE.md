@@ -162,6 +162,16 @@ Weaviate returns cosine distance (0 = identical, 2 = opposite). All collections 
 | 0.15 – 0.35 | B | Claude arbitration |
 | > 0.35 | C | Propose new subtopic or candidate |
 
+### AI Review pre-computation (Taxonomy Governance)
+
+Before calling Claude (Prompt 6) for a taxonomy review, the pipeline calls `find_similar_subtopics()` for each selected subtopic. Pairs with distance < 0.25 are included in the prompt as pre-computed hints so Claude confirms rather than guesses similarity. This is done via `_enrich_with_weaviate_similarity()` in `taxonomy_ai.py`.
+
+| Distance | Meaning |
+|----------|---------|
+| < 0.15 | Very likely duplicates — strong merge candidate |
+| 0.15 – 0.25 | Closely related — Claude should evaluate for merge |
+| > 0.25 | Not included in pre-computation |
+
 ### RAG retrieval (Phase 2c — not yet built)
 
 | Distance | Action |
